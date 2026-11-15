@@ -811,6 +811,7 @@ test('CRUD模块：筛选、导出、登记、动作、指标全链路', async (
 
   for (const mod of crudModules) {
     await page.goto(`/${mod.key}`)
+    await page.waitForTimeout(1500)
     const bodyRows = page.locator('tbody tr[data-testid^="row-"]')
     await expect(bodyRows).toHaveCount(3)
     const firstValue = await bodyRows.nth(0).locator('td').nth(0).innerText()
@@ -855,6 +856,7 @@ test('DAG拓扑模块：节点渲染、详情、动作、导出', async ({ page 
 
   for (const mod of dagModules) {
     await page.goto(`/${mod.key}`)
+    await page.waitForTimeout(1500)
     await expect(page.locator('svg.dag-svg')).toBeVisible()
     const nodes = page.locator('g.dag-node')
     const count = await nodes.count()
