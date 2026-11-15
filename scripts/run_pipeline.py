@@ -116,7 +116,7 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int) -
         "lines_written": scaffold["lines_written"],
     })
     record["steps"]["生成"] = True
-    # 规范化 spec 由 scaffold 写入仓库并复制到外层容器；这里不重复复制、不删除输入。
+# 规范化 spec 由 scaffold 写入仓库并复制到外层容器；这里不重复复制、不删除输入。
     log("生成", f"{record['project_id']} {record['app_name']}"
                 f"（{record['kind']}）-> {repo_root}")
 

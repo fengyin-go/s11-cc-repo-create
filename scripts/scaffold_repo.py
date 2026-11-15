@@ -4041,7 +4041,7 @@ def main() -> int:
 
     result = scaffold(spec, out)
 
-    # 规范化 spec 已在仓库内保存；外层再留一份便于任务管理，绝不删除用户输入文件。
+# 规范化 spec 已在仓库内保存；外层再留一份便于任务管理，绝不删除用户输入文件。
     if args.parent and args.spec:
         src = Path(args.spec).expanduser().resolve()
         shutil.copy2(out / ".s11-spec.json", container / src.name)
