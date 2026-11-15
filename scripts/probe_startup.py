@@ -30,7 +30,9 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 
 def free_port(preferred: int) -> int:
@@ -268,6 +270,17 @@ def run_clean_clone(repo: Path, args) -> int:
                "、".join(carried[:5]) or "node_modules / .venv / dist / build 都没进仓库",
                carried=carried[:10])
 
+        # ── 共享依赖缓存——源仓库已有 node_modules/.venv 时用软链挂到克隆中，跳过重装 ──
+        cached = []
+        for name, target_dir in [("node_modules", "frontend"), (".venv", "backend")]:
+            src_dep = repo / target_dir / name if (repo / target_dir).exists() else None
+            dst_dep = clone / target_dir / name
+            if src_dep and src_dep.is_dir() and not dst_dep.exists():
+                dst_dep.symlink_to(src_dep.resolve(), target_is_directory=True)
+                cached.append(f"{target_dir}/{name}")
+        if cached:
+            record("共享依赖缓存（软链到源仓库）", True, "、".join(cached))
+
         command = [sys.executable, str(Path(__file__).resolve()), "--repo", str(clone),
                    "--timeout", str(args.timeout)]
         if args.build:
@@ -361,6 +374,44 @@ def main() -> int:
 
     live_backend_port: int | None = None
     live_frontend_port: int | None = None
+
+    install_futures: list[Any] = []
+    install_pool = ThreadPoolExecutor(max_workers=2) if not args.skip_install else None
+
+    def _install_backend() -> tuple[str, bool, str]:
+        if kind == "frontend-only" or backend["kind"] != "python":
+            return ("backend", True, "no install needed")
+        venv = backend_dir / ".venv"
+        python_bin = venv / "bin" / "python"
+        if python_bin.exists():
+            return ("backend", True, "already installed")
+        proc = run_command([sys.executable, "-m", "venv", str(venv)],
+                           cwd=backend_dir, timeout=args.timeout)
+        if proc.returncode != 0:
+            return ("backend", False, proc.stderr[-400:] or "venv create failed")
+        pip = run_command(
+            [str(venv / "bin" / "pip"), "install", "-q", "-r", "requirements.txt"],
+            cwd=backend_dir, timeout=args.timeout * 2)
+        pip_tail = "\n".join((pip.stderr or pip.stdout).strip().splitlines()[-3:])
+        return ("backend", pip.returncode == 0, pip_tail or "ok")
+
+    def _install_frontend() -> tuple[str, bool, str]:
+        if frontend_dir is None:
+            return ("frontend", True, "no frontend")
+        if (frontend_dir / "node_modules").is_dir():
+            return ("frontend", True, "already installed")
+        npm = shutil.which("npm")
+        if npm is None:
+            return ("frontend", False, "npm not found")
+        install_command = "ci" if (frontend_dir / "package-lock.json").is_file() else "install"
+        proc = run_command([npm, install_command, "--no-audit", "--no-fund"],
+                           cwd=frontend_dir, timeout=args.timeout * 2)
+        return ("frontend", proc.returncode == 0, (proc.stderr or proc.stdout)[-600:] or "ok")
+
+    if install_pool is not None:
+        install_futures.append(install_pool.submit(_install_backend))
+        install_futures.append(install_pool.submit(_install_frontend))
+
     try:
         # ---------- 后端 ----------
         if kind == "frontend-only":
@@ -369,15 +420,12 @@ def main() -> int:
             venv = backend_dir / ".venv"
             python_bin = venv / "bin" / "python"
             if not python_bin.exists() and not args.skip_install:
-                proc = run_command([sys.executable, "-m", "venv", str(venv)],
-                                   cwd=backend_dir, timeout=args.timeout)
-                record("后端创建虚拟环境", proc.returncode == 0, proc.stderr[-400:] or "ok")
-                pip = run_command(
-                    [str(venv / "bin" / "pip"), "install", "-q", "-r", "requirements.txt"],
-                    cwd=backend_dir, timeout=args.timeout * 2)
-                pip_tail = "\n".join((pip.stderr or pip.stdout).strip().splitlines()[-3:])
-                record("后端安装依赖", pip.returncode == 0,
-                       pip_tail or "ok")
+                # 等待并发安装完成
+                if install_futures:
+                    for f in install_futures:
+                        name, ok_, detail = f.result()
+                        if name == "backend":
+                            record("后端安装依赖", ok_, detail)
             if not python_bin.exists():
                 record("后端依赖就绪", False, f"{python_bin} 不存在，请先装依赖或去掉 --skip-install")
             else:
@@ -452,15 +500,11 @@ def main() -> int:
             record("前端启动", False, "找不到前端目录")
         else:
             if not (frontend_dir / "node_modules").is_dir() and not args.skip_install:
-                npm = shutil.which("npm")
-                if npm is None:
-                    record("前端安装依赖", False, "本机没有 npm")
-                else:
-                    install_command = "ci" if (frontend_dir / "package-lock.json").is_file() else "install"
-                    proc = run_command([npm, install_command, "--no-audit", "--no-fund"],
-                                       cwd=frontend_dir, timeout=args.timeout * 2)
-                    record("前端安装依赖", proc.returncode == 0,
-                           (proc.stderr or proc.stdout)[-600:] or "ok")
+                # 等待并发安装完成
+                for f in install_futures:
+                    name, ok_, detail = f.result()
+                    if name == "frontend":
+                        record("前端安装依赖", ok_, detail)
             port = free_port(frontend_port)
             npm = shutil.which("npm") or "npm"
             frontend_env = {"BROWSER": "none", "CI": "1"}
@@ -504,11 +548,16 @@ def main() -> int:
                 record("浏览器全功能验收", False,
                        "前端未就绪、缺少 tests/functionality.spec.ts 或本机没有 npx")
             else:
-                installed = run_command([npx, "playwright", "install", "chromium"],
-                                        cwd=frontend_dir, timeout=max(300.0, args.timeout * 2))
-                record("浏览器运行时就绪", installed.returncode == 0,
-                       (installed.stderr or installed.stdout)[-600:] or "ok")
-                if installed.returncode == 0:
+                # 已全局安装过 Chromium 就跳过，节省 20-30s
+                chromium_installed = (
+                    (Path.home() / "Library/Caches/ms-playwright").is_dir()
+                    or (os.environ.get("PLAYWRIGHT_BROWSERS_PATH") and Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]).is_dir())
+                )
+                install_chromium = run_command([npx, "playwright", "install", "chromium"],
+                                               cwd=frontend_dir, timeout=max(300.0, args.timeout * 2))
+                record("浏览器运行时就绪", install_chromium.returncode == 0 or chromium_installed,
+                       "已安装，跳过" if chromium_installed else (install_chromium.stderr or install_chromium.stdout)[-600:] or "ok")
+                if install_chromium.returncode == 0 or chromium_installed:
                     e2e_env = {**os.environ, "CI": "1", "E2E_BASE_URL": f"http://127.0.0.1:{live_frontend_port}"}
                     e2e = run_command([npm, "run", "test:e2e"], cwd=frontend_dir,
                                       timeout=max(360.0, args.timeout * 2), env=e2e_env)
