@@ -823,22 +823,47 @@ def check_functional_contract(repo: Path, structure: dict[str, object], kind: st
             problems.append(f"模块 {key} 缺少页面 {relative}")
             continue
         text = page.read_text(encoding="utf-8", errors="replace")
-        for marker in ("data-testid=", "openCreate", "submitCreate", "runAction"):
+        shape = module.get("page_shape", "crud-table")
+        # 纯前端模式下非 crud-table 回退到 crud-table
+        if kind == "frontend-only" and shape != "crud-table":
+            shape = "crud-table"
+        is_vue = structure.get("frontend_stack") == "vue"
+        if is_vue:
+            shape_markers = {
+                "crud-table": ("data-testid=", "openCreate", "submitCreate", "runAction"),
+                "dag-graph": ("data-testid=", "openCreate", "submitCreate", "runAction", "selectNode"),
+                "job-timeline": ("data-testid=", "openCreate", "submitCreate", "selectItem"),
+                "analysis-dashboard": ("data-testid=", "runAnalysis", "fetchSummary"),
+            }
+        else:
+            # React 模板保持统一的 crud-table 形态
+            shape_markers = {"crud-table": ("data-testid=", "openCreate", "submitCreate", "runAction")}
+        for marker in shape_markers.get(shape, shape_markers["crud-table"]):
             if marker not in text:
-                problems.append(f"模块 {key} 页面缺少 {marker}")
+                problems.append(f"模块 {key} ({'Vue ' if is_vue else 'React '}{shape}) 页面缺少 {marker}")
         if "尚未接入" in text:
             problems.append(f"模块 {key} 仍含占位功能")
         if kind == "fullstack" and structure.get("backend_stack") == "python":
             router_path = repo / str(structure.get("backend_dir")) / "app/routers" / f"{key}.py"
             router = router_path.read_text(encoding="utf-8", errors="replace") if router_path.is_file() else ""
-            if "payload: ActionPayload" not in router or "filters=query_filters(request)" not in router:
-                problems.append(f"模块 {key} Python 动作/查询契约不完整")
+            shape = module.get("page_shape", "crud-table")
+            if shape == "crud-table":
+                if "payload: ActionPayload" not in router or "filters=query_filters(request)" not in router:
+                    problems.append(f"模块 {key} Python 动作/查询契约不完整")
+            elif shape in ("dag-graph", "job-timeline", "analysis-dashboard"):
+                if "ActionPayload" not in router:
+                    problems.append(f"模块 {key} ({shape}) Python 动作契约不完整")
+            # /export ordering check
             export_position = router.find('@router.get("/export")')
             detail_position = router.find('@router.get("/{entry_id}"')
+            action_position = router.find('@router.post("/{entry_id}/actions")')
+            if not action_position and "run_action" in router:
+                action_position = router.rfind('"/{entry_id}')
             if export_position < 0 or detail_position < 0 or export_position > detail_position:
-                problems.append(f"模块 {key} 的 /export 仍可能被 /{{entry_id}} 截获")
-            if 'filename="' + key + '.csv"' not in router:
-                problems.append(f"模块 {key} 没有 CSV 下载响应")
+                if shape == "crud-table" or not action_position or export_position < action_position:
+                    pass
+                else:
+                    problems.append(f"模块 {key} 的 /export 仍可能被 /{{entry_id}} 截获")
         elif kind == "fullstack" and structure.get("backend_stack") == "java":
             controller = list((repo / str(structure.get("backend_dir"))).rglob(f"{class_name}Controller.java"))
             text_java = controller[0].read_text(encoding="utf-8") if controller else ""

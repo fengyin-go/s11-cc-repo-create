@@ -335,7 +335,23 @@ def normalize_spec(raw_spec: dict, frontend: str | None = None, backend: str | N
                 raise SystemExit(f"模块 {key}.metrics 必须正好有 3 项，对应页面三张指标卡")
         if module.get("desc") is not None and not isinstance(module["desc"], str):
             raise SystemExit(f"模块 {key}.desc 必须是字符串")
+        page_shape = module.get("page_shape", "crud-table")
+        if page_shape not in ("crud-table", "dag-graph", "job-timeline", "analysis-dashboard"):
+            raise SystemExit(
+                f"模块 {key}.page_shape 必须是 crud-table、dag-graph、job-timeline、analysis-dashboard 之一，"
+                f"不支持 {page_shape!r}")
+        if "page_shape" in module:
+            module["_page_shape_explicit"] = True
+        module["page_shape"] = page_shape
         normalized_modules.append(module)
+    # 只有当 spec 显式声明了 page_shape 时才要求多样性；兼容旧 spec
+    explicit_shapes = [m for m in normalized_modules if m.get("_page_shape_explicit")]
+    if explicit_shapes:
+        non_crud_count = sum(1 for m in normalized_modules if m["page_shape"] != "crud-table")
+        if non_crud_count < 2:
+            raise SystemExit(
+                f"至少 2 个模块需要非 crud-table 的 page_shape，避免全仓库页面同质化。"
+                f"当前只有 {non_crud_count} 个")
     spec["modules"] = normalized_modules
     return spec
 
@@ -1146,6 +1162,38 @@ body { margin: 0; background: #f6f8fb; color: #1f2937; }
 .create-field { display: block; margin-bottom: 10px; }
 .create-field span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
 .create-field input { width: 100%; box-sizing: border-box; border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
+/* DAG 拓扑图 */
+.dag-wrap { position: relative; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: #fff; min-height: 320px; user-select: none; }
+.dag-svg { width: 100%; height: 100%; }
+.dag-node { cursor: grab; transition: stroke 0.15s; }
+.dag-node text { font-size: 12px; fill: #1f2937; }
+.dag-node.selected rect { stroke: var(--brand); stroke-width: 2; }
+.dag-edge { stroke: #94a3b8; stroke-width: 1.5; fill: none; marker-end: url(#arrowhead); }
+.dag-detail { border-top: 1px solid var(--border); padding: 12px; background: #fafbfc; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.dag-detail dt { font-size: 12px; color: var(--muted); }
+.dag-detail dd { font-size: 13px; margin: 0 0 8px 0; }
+/* 时间线 */
+.timeline-wrap { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow-x: auto; }
+.timeline-row { display: flex; align-items: center; margin-bottom: 8px; padding: 4px 0; border-bottom: 1px solid #f0f2f5; }
+.timeline-label { width: 140px; font-size: 13px; flex-shrink: 0; }
+.timeline-track { flex: 1; position: relative; height: 28px; background: #f0f2f5; border-radius: 4px; overflow: hidden; }
+.timeline-bar { position: absolute; top: 4px; height: 20px; border-radius: 3px; font-size: 11px; line-height: 20px; padding: 0 6px; color: #fff; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.timeline-bar.status-待执行 { background: #94a3b8; }
+.timeline-bar.status-运行中 { background: #3b82f6; }
+.timeline-bar.status-已完成 { background: #22c55e; }
+.timeline-bar.status-失败 { background: #ef4444; }
+.timeline-log { padding: 10px 14px; background: #1e293b; color: #e2e8f0; border-radius: 6px; font-family: monospace; font-size: 12px; max-height: 180px; overflow-y: auto; margin-top: 8px; }
+/* 分析看板 */
+.analysis-summary { display: flex; gap: 12px; flex-wrap: wrap; }
+.analysis-card { flex: 1; min-width: 140px; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.analysis-card .trend-up { color: #22c55e; }
+.analysis-card .trend-down { color: #ef4444; }
+.analysis-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin: 12px 0; padding: 12px; background: #fff; border: 1px solid var(--border); border-radius: 8px; }
+.analysis-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.analysis-form input, .analysis-form select { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+.analysis-chart { display: flex; align-items: flex-end; gap: 8px; height: 160px; padding: 12px 0; }
+.analysis-bar { flex: 1; border-radius: 4px 4px 0 0; background: var(--brand); min-width: 24px; position: relative; transition: height 0.4s; }
+.analysis-bar span { position: absolute; bottom: -20px; left: 50%; transform: translateX(-50%); font-size: 10px; color: var(--muted); white-space: nowrap; }
 """
 
 VUE_VIEW = """\
@@ -1336,6 +1384,216 @@ async function reload() {
 }
 
 onMounted(reload)
+</script>
+"""
+
+VUE_DAG_GRAPH = """\
+<template>
+  <section class="page" data-module="__KEY__">
+    <header class="page-head">
+      <div><h2>__NAME__</h2><p class="page-desc">__DESC__</p></div>
+      <div class="page-actions">
+        <button class="btn primary" type="button" data-testid="open-create" @click="openCreate">登记__ENTITY__</button>
+        <button class="btn" type="button" data-testid="export" @click="exportRows">导出关系清单</button>
+      </div>
+    </header>
+    <div class="dag-wrap" ref="dagRef">
+      <svg class="dag-svg" :viewBox="`0 0 ${svgW} ${svgH}`">
+        <defs><marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#94a3b8"/></marker></defs>
+        <g v-for="edge in graph.edges" :key="edge.from+edge.to">
+          <line class="dag-edge" :x1="nodePos[edge.from]?.x||0" :y1="nodePos[edge.from]?.y||0" :x2="nodePos[edge.to]?.x||0" :y2="nodePos[edge.to]?.y||0"/>
+          <text :x="(nodePos[edge.from]?.x+nodePos[edge.to]?.x)/2" :y="(nodePos[edge.from]?.y+nodePos[edge.to]?.y)/2 - 6" font-size="10" fill="#64748b" text-anchor="middle">{{ edge.label }}</text>
+        </g>
+        <g v-for="node in graph.nodes" :key="node.id" :class="['dag-node', {selected: selectedNode?.id===node.id}]" @click="selectNode(node)" @mousedown="startDrag($event, node)">
+          <rect :x="nodePos[node.id]?.x - 60" :y="nodePos[node.id]?.y - 20" width="120" height="40" rx="6" :fill="nodeColor(node.status)"/>
+          <text :x="nodePos[node.id]?.x" :y="nodePos[node.id]?.y + 4" text-anchor="middle">{{ node.name || node.label }}</text>
+        </g>
+      </svg>
+    </div>
+    <div v-if="selectedNode" class="dag-detail" data-testid="dag-detail">
+      <dl><dt>编号</dt><dd>{{ selectedNode.id }}</dd></dl>
+      <dl><dt>名称</dt><dd>{{ selectedNode.name || selectedNode.label }}</dd></dl>
+      <dl v-for="f in detailFields" :key="f"><dt>{{ f }}</dt><dd>{{ selectedNode[f] ?? '—' }}</dd></dl>
+      <div style="grid-column:1/-1; margin-top:8px; display:flex; gap:6px;">
+        <button v-for="action in actions" :key="action" class="btn" :data-testid="`action-${selectedNode.id}-${action}`" @click="runAction(action, selectedNode)">{{ action }}</button>
+      </div>
+    </div>
+    <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
+      <form class="modal" @submit.prevent="submitCreate"><h3>登记__ENTITY__</h3>
+        <label v-for="field in columns.slice(0,3)" :key="field" class="create-field"><span>{{ field }}</span><input v-model="createValues[field]" :placeholder="`请输入${field}`" required /></label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+          <button class="btn" type="button" @click="showCreate=false">取消</button>
+          <button class="btn primary" type="submit" data-testid="submit-create">提交</button>
+        </div>
+      </form>
+    </div>
+    <footer class="page-foot"><span>{{ graph.nodes.length }} 个节点</span></footer>
+  </section>
+</template>
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref } from 'vue'
+import { request } from '@/api/client'
+const ENDPOINT = '/api/__KEY__'
+const columns = __FIELDS__
+const actions = __ACTIONS__
+const statuses = __STATUSES__
+const STATUS_COLORS: Record<string,string> = { '草稿':'#e2e8f0','待校验':'#fef3c7','已启用':'#d1fae5','已停用':'#fee2e2' }
+const nodeColor = (s: string) => STATUS_COLORS[s] || '#e2e8f0'
+const graph = reactive<{nodes: any[], edges: any[]}>({ nodes: [], edges: [] })
+const nodePos = ref<Record<number,{x:number;y:number}>>({})
+const selectedNode = ref<any>(null)
+const detailFields = computed(() => columns.filter((f: string) => !['id','name','label','status'].includes(f)))
+const svgW = ref(800); const svgH = ref(400)
+const errorMessage = ref('')
+const creating = ref(false); const showCreate = ref(false)
+const createValues = ref<Record<string,string>>({})
+let dragNode: any = null; const dagRef = ref<HTMLElement|null>(null)
+function layout(nodes: any[]) {
+  const w = 800; const h = Math.max(400, nodes.length * 80)
+  svgW.value = w; svgH.value = h
+  const pos: Record<number,{x:number;y:number}> = {}
+  nodes.forEach((n,i) => { pos[n.id] = { x: 120 + (i % 5) * 150, y: 50 + Math.floor(i / 5) * 80 } })
+  nodePos.value = pos
+}
+function selectNode(node: any) { selectedNode.value = selectedNode.value?.id === node.id ? null : node }
+function startDrag(e: MouseEvent, node: any) { dragNode = node; const onMove = (ev: MouseEvent) => { if(!dragNode) return; nodePos.value[node.id] = { x: ev.offsetX, y: ev.offsetY } }; const onUp = () => { dragNode = null; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp) }; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp) }
+async function reload() {
+  try { const res = await request(ENDPOINT); const data = await res.json(); graph.nodes = data.nodes || []; graph.edges = data.edges || []; layout(graph.nodes) } catch(e) { errorMessage.value = '加载失败' }
+}
+async function runAction(action: string, node: any) {
+  try { await request(`${ENDPOINT}/${node.id}/actions`, { method: 'POST', body: JSON.stringify({ action }) }); await reload() } catch(e) { errorMessage.value = '操作失败' }
+}
+function openCreate() { createValues.value = {}; showCreate.value = true }
+async function submitCreate() {
+  try { const res = await request(ENDPOINT, { method: 'POST', body: JSON.stringify({ values: createValues.value }) }); if(!res.ok) throw new Error('创建失败'); showCreate.value = false; await reload() } catch(e: any) { errorMessage.value = e.message }
+}
+function exportRows() { window.open(`${ENDPOINT}/export`, '_blank') }
+onMounted(reload)
+</script>
+"""
+
+VUE_JOB_TIMELINE = """\
+<template>
+  <section class="page" data-module="__KEY__">
+    <header class="page-head">
+      <div><h2>__NAME__</h2><p class="page-desc">__DESC__</p></div>
+      <div class="page-actions">
+        <button class="btn primary" type="button" data-testid="open-create" @click="openCreate">登记__ENTITY__</button>
+        <button class="btn" type="button" data-testid="export" @click="exportRows">导出作业清单</button>
+      </div>
+    </header>
+    <div class="filter-bar">
+      <label><span>开始日期</span><input type="date" v-model="dateFrom" /></label>
+      <label><span>结束日期</span><input type="date" v-model="dateTo" /></label>
+      <button class="btn" type="button" @click="reload">查询</button>
+    </div>
+    <div class="timeline-wrap">
+      <div v-for="item in timelineItems" :key="item.id" class="timeline-row">
+        <span class="timeline-label">{{ item.name || item.label }}</span>
+        <div class="timeline-track">
+          <div class="timeline-bar" :class="`status-${item.status}`" :style="{ left: barLeft(item) + '%', width: barWidth(item) + '%' }" :data-testid="`bar-${item.id}`" :title="`${item.start} ~ ${item.end}`" @click="selectItem(item)">&nbsp;</div>
+        </div>
+        <span style="font-size:12px;color:var(--muted);margin-left:8px;">{{ item.start }} ~ {{ item.end }}</span>
+      </div>
+      <p v-if="!timelineItems.length" style="text-align:center;color:var(--muted)">暂无作业记录</p>
+    </div>
+    <div v-if="selectedItem" class="timeline-log" data-testid="timeline-log">
+      <strong>{{ selectedItem.name || selectedItem.label }}</strong> — 状态：{{ selectedItem.status }}
+      <div style="margin-top:4px;">{{ selectedItem.logs || '暂无日志' }}</div>
+    </div>
+    <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
+      <form class="modal" @submit.prevent="submitCreate"><h3>登记__ENTITY__</h3>
+        <label v-for="field in columns.slice(0,3)" :key="field" class="create-field"><span>{{ field }}</span><input v-model="createValues[field]" :placeholder="`请输入${field}`" required /></label>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+          <button class="btn" type="button" @click="showCreate=false">取消</button>
+          <button class="btn primary" type="submit" data-testid="submit-create">提交</button>
+        </div>
+      </form>
+    </div>
+  </section>
+</template>
+<script setup lang="ts">
+import { onMounted, ref } from 'vue'
+import { request } from '@/api/client'
+const ENDPOINT = '/api/__KEY__'
+const columns = __FIELDS__
+const actions = __ACTIONS__
+const timelineItems = ref<any[]>([])
+const selectedItem = ref<any>(null)
+const dateFrom = ref(''); const dateTo = ref('')
+const errorMessage = ref(''); const showCreate = ref(false)
+const createValues = ref<Record<string,string>>({})
+const allItems = ref<any[]>([])
+function barLeft(item: any) { const all = allItems.value.filter(i => i.start && i.end); if(!all.length) return 0; const min = Math.min(...all.map(i => new Date(i.start).getTime())); const max = Math.max(...all.map(i => new Date(i.end).getTime())); const range = max - min || 86400000; return ((new Date(item.start).getTime() - min) / range) * 100 }
+function barWidth(item: any) { const all = allItems.value.filter(i => i.start && i.end); if(!all.length) return 20; const min = Math.min(...all.map(i => new Date(i.start).getTime())); const max = Math.max(...all.map(i => new Date(i.end).getTime())); const range = max - min || 86400000; return Math.max(5, ((new Date(item.end).getTime() - new Date(item.start).getTime()) / range) * 100) }
+function selectItem(item: any) { selectedItem.value = selectedItem.value?.id === item.id ? null : item }
+async function reload() {
+  try { const res = await request(ENDPOINT); const data = await res.json(); allItems.value = data.items || []; applyFilter() } catch(e) { errorMessage.value = '加载失败' }
+}
+function applyFilter() {
+  let items = allItems.value
+  if(dateFrom.value) items = items.filter((i: any) => i.start >= dateFrom.value)
+  if(dateTo.value) items = items.filter((i: any) => i.end <= dateTo.value)
+  timelineItems.value = items; selectedItem.value = null
+}
+function openCreate() { createValues.value = {}; showCreate.value = true }
+async function submitCreate() {
+  try { const res = await request(ENDPOINT, { method: 'POST', body: JSON.stringify({ values: createValues.value }) }); if(!res.ok) throw new Error('创建失败'); showCreate.value = false; await reload() } catch(e: any) { errorMessage.value = e.message }
+}
+function exportRows() { window.open(`${ENDPOINT}/export`, '_blank') }
+onMounted(reload)
+</script>
+"""
+
+VUE_ANALYSIS_DASHBOARD = """\
+<template>
+  <section class="page" data-module="__KEY__">
+    <header class="page-head">
+      <div><h2>__NAME__</h2><p class="page-desc">__DESC__</p></div>
+    </header>
+    <div class="analysis-summary">
+      <article v-for="m in summaryMetrics" :key="m.label" class="analysis-card" data-testid="kpi-card">
+        <span style="font-size:12px;color:var(--muted)">{{ m.label }}</span>
+        <strong style="font-size:22px;display:block">{{ m.value }}</strong>
+        <span :class="m.trend > 0 ? 'trend-up' : 'trend-down'" style="font-size:12px">{{ m.trend > 0 ? '↑' : '↓' }}{{ Math.abs(m.trend) }}%</span>
+      </article>
+    </div>
+    <form class="analysis-form" @submit.prevent="runAnalysis">
+      <label v-for="field in paramFields" :key="field"><span>{{ field }}</span>
+        <select v-if="field.includes('方法')||field.includes('策略')||field.includes('粒度')" v-model="params[field]"><option v-for="o in options[field]" :key="o" :value="o">{{ o }}</option></select>
+        <input v-else v-model="params[field]" :placeholder="`请输入${field}`" />
+      </label>
+      <button class="btn primary" type="submit" data-testid="run-analysis">运行分析</button>
+    </form>
+    <div v-if="chartData.length" class="analysis-chart">
+      <div v-for="(bar, i) in chartData" :key="i" class="analysis-bar" :style="{ height: barHeight(bar.value) + 'px' }"><span>{{ bar.label }}</span></div>
+    </div>
+    <table class="data-table" v-if="results.length">
+      <thead><tr><th v-for="c in resultColumns" :key="c">{{ c }}</th></tr></thead>
+      <tbody><tr v-for="row in results" :key="row.id"><td v-for="c in resultColumns" :key="c">{{ row[c] ?? '—' }}</td></tr></tbody>
+    </table>
+    <p v-if="!results.length && !loading" style="text-align:center;color:var(--muted)">请配置参数后运行分析</p>
+  </section>
+</template>
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
+import { request } from '@/api/client'
+const ENDPOINT = '/api/__KEY__'
+const summaryMetrics = ref<{label:string;value:number;trend:number}[]>([])
+const results = ref<any[]>([]); const chartData = ref<{label:string;value:number}[]>([])
+const loading = ref(false)
+const params = ref<Record<string,string>>({})
+const paramFields = __FIELDS__.filter((f: string) => !['编号','名称','版本'].includes(f)).slice(0, 4)
+const options: Record<string,string[]> = { '统计粒度': ['按日','按周','按月'], '分组字段': ['全量','按类型','按区域'], '比较方法': ['环比','同比','绝对值'], '时间范围': ['最近7天','最近30天','最近90天'] }
+const resultColumns = computed(() => __FIELDS__.slice(0, 5))
+function barHeight(v: number) { const max = Math.max(...chartData.value.map(d => d.value), 1); return Math.max(10, (v / max) * 140) }
+async function fetchSummary() { try { const res = await request(`${ENDPOINT}/summary`); summaryMetrics.value = (await res.json()).metrics || [] } catch(e) {} }
+async function runAnalysis() {
+  loading.value = true
+  try { const res = await request(`${ENDPOINT}/run`, { method: 'POST', body: JSON.stringify({ values: params.value }) }); const data = await res.json(); results.value = data.items || []; chartData.value = (data.items || []).map((r: any) => ({ label: Object.values(r)[0] as string, value: Object.values(r).filter(v => typeof v === 'number')[0] as number || 0 })).slice(0, 6) } catch(e) { results.value = [] }
+  loading.value = false
+}
+onMounted(fetchSummary)
 </script>
 """
 
@@ -2922,6 +3180,391 @@ class __CLASS__Service:
         return entry, f"__ENTITY__已{action}"
 '''
 
+ROUTER_DAG_PY = '''\
+"""__NAME__ DAG 拓扑接口：返回节点、连线图结构。"""
+from __future__ import annotations
+
+import csv
+import io
+import json
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+
+from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.services.__KEY__ import __CLASS__Service
+
+router = APIRouter(prefix="/api/__KEY__", tags=["__NAME__"])
+service = __CLASS__Service()
+LIST_FIELDS = __FIELDS__
+STATUSES = __STATUSES__
+
+
+@router.get("")
+def get_graph() -> dict[str, Any]:
+    """返回节点与边组成的 DAG 图数据。"""
+    return service.get_graph()
+
+
+@router.get("/export")
+def export_entries() -> StreamingResponse:
+    nodes, edges = service.raw_data()
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    writer.writerow(["type", "id", "name", "from", "to", "label", "status"])
+    for node in nodes:
+        writer.writerow(["node", node.get("id",""), csv_cell(node.get("name","")), "", "", "", node.get("status","")])
+    for edge in edges:
+        writer.writerow(["edge", "", "", edge.get("from",""), edge.get("to",""), edge.get("label",""), ""])
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv; charset=utf-8",
+                             headers={"Content-Disposition": "attachment; filename=__KEY__.csv"})
+
+
+@router.get("/{entry_id}")
+def get_entry(entry_id: int) -> dict:
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"__ENTITY__ {entry_id} 不存在")
+    return entry
+
+
+@router.post("")
+def create_entry(payload: EntryPayload) -> ActionResult:
+    entry_or_none, missing = service.create_entry(payload.values)
+    if missing:
+        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    return ActionResult(ok=True, message="__ENTITY__已登记", entry=entry_or_none)
+
+
+@router.post("/{entry_id}/actions")
+def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
+    entry_or_none, message = service.run_action(entry_id, payload.action)
+    if entry_or_none is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry_or_none)
+'''
+
+SERVICE_DAG_PY = '''\
+"""__NAME__ DAG 图服务：生成节点、边示例结构与流转规则。"""
+from __future__ import annotations
+
+from typing import Any
+
+from app.store import store
+
+MODULE = "__KEY__"
+REQUIRED_FIELDS = __REQUIRED_FIELDS__
+STATUS_ORDER = __STATUSES__
+ACTION_RULES = __ACTION_RULES__
+NEGATIVE_ACTIONS = __NEGATIVE_ACTIONS__
+
+
+def csv_cell(value: Any) -> str:
+    text = str(value) if value is not None else ""
+    if text and text[0] in "=+-@":
+        text = "'" + text
+    return '"' + text.replace('"', '""') + '"'
+
+
+class __CLASS__Service:
+    def get_graph(self) -> dict[str, Any]:
+        rows = store.rows(MODULE)
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        for i, row in enumerate(rows):
+            nodes.append({"id": int(row.get("id", i+1)), "name": str(row.get(list(row.keys())[1] if len(row)>1 else "name", "")), "status": str(row.get("status", STATUS_ORDER[0])),
+                          **{k: row[k] for k in row if k not in ("id","status","pending","abnormal")}})
+        for i in range(len(nodes)-1):
+            edges.append({"from": nodes[i]["id"], "to": nodes[i+1]["id"], "label": "依赖"})
+        return {"nodes": nodes, "edges": edges}
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        return store.find(MODULE, entry_id)
+
+    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        missing = [f for f in REQUIRED_FIELDS if not str(values.get(f) or "").strip()]
+        if missing:
+            return None, missing
+        rows = store.rows(MODULE)
+        entry = {"id": max((int(r.get("id",0)) for r in rows), default=0) + 1}
+        entry.update({f: values.get(f) for f in REQUIRED_FIELDS})
+        entry["status"] = STATUS_ORDER[0]
+        entry["pending"] = True
+        entry["abnormal"] = False
+        rows.append(entry)
+        return entry, []
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        entry = store.find(MODULE, entry_id)
+        if entry is None:
+            return None, f"__ENTITY__ {entry_id} 不存在或已归档"
+        if action not in ACTION_RULES:
+            return None, f"动作「{action}」不属于__NAME__可执行范围"
+        target = ACTION_RULES[action]
+        entry["status"] = target
+        entry["pending"] = target != STATUS_ORDER[-1]
+        entry["abnormal"] = action in NEGATIVE_ACTIONS
+        return entry, f"__ENTITY__已{action}"
+
+    def raw_data(self) -> tuple[list[dict], list[dict]]:
+        g = self.get_graph()
+        return g["nodes"], g["edges"]
+'''
+
+ROUTER_TIMELINE_PY = '''\
+"""__NAME__ 时间线接口：返回作业时间序列结构。"""
+from __future__ import annotations
+
+import csv
+import io
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+
+from app.schemas import ActionPayload, ActionResult, EntryPayload
+from app.services.__KEY__ import __CLASS__Service
+
+router = APIRouter(prefix="/api/__KEY__", tags=["__NAME__"])
+service = __CLASS__Service()
+LIST_FIELDS = __FIELDS__
+STATUSES = __STATUSES__
+
+
+def csv_cell(value: Any) -> str:
+    text = str(value) if value is not None else ""
+    if text and text[0] in "=+-@":
+        text = "'" + text
+    return '"' + text.replace('"', '""') + '"'
+
+
+@router.get("")
+def list_entries() -> dict[str, Any]:
+    items = service.get_timeline()
+    return {"items": items}
+
+
+@router.get("/export")
+def export_entries() -> StreamingResponse:
+    items = service.get_timeline()
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    all_keys = ["id"]
+    if items:
+        all_keys = list(items[0].keys())
+    writer.writerow(all_keys)
+    for item in items:
+        writer.writerow([csv_cell(item.get(k, "")) for k in all_keys])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv; charset=utf-8",
+                             headers={"Content-Disposition": "attachment; filename=__KEY__.csv"})
+
+
+@router.get("/{entry_id}")
+def get_entry(entry_id: int) -> dict:
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"__ENTITY__ {entry_id} 不存在")
+    return entry
+
+
+@router.post("")
+def create_entry(payload: EntryPayload) -> ActionResult:
+    entry_or_none, missing = service.create_entry(payload.values)
+    if missing:
+        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    return ActionResult(ok=True, message="__ENTITY__已登记", entry=entry_or_none)
+
+
+@router.post("/{entry_id}/actions")
+def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
+    entry_or_none, message = service.run_action(entry_id, payload.action)
+    if entry_or_none is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry_or_none)
+'''
+
+SERVICE_TIMELINE_PY = '''\
+"""__NAME__ 时间线服务：生成作业时间序列和示例数据。"""
+from __future__ import annotations
+
+from datetime import date, timedelta
+from typing import Any
+
+from app.store import store
+
+MODULE = "__KEY__"
+REQUIRED_FIELDS = __REQUIRED_FIELDS__
+STATUS_ORDER = __STATUSES__
+ACTION_RULES = __ACTION_RULES__
+NEGATIVE_ACTIONS = __NEGATIVE_ACTIONS__
+
+
+class __CLASS__Service:
+    def get_timeline(self) -> list[dict[str, Any]]:
+        rows = store.rows(MODULE)
+        today = date.today()
+        items: list[dict] = []
+        for i, row in enumerate(rows):
+            start = (today - timedelta(days=7 - i * 2)).isoformat()
+            end = (today + timedelta(days=3 - i)).isoformat()
+            items.append({
+                "id": int(row.get("id", i + 1)),
+                "name": str(row.get(list(row.keys())[1] if len(row) > 1 else "name", "")),
+                "start": start,
+                "end": end,
+                "status": str(row.get("status", STATUS_ORDER[i % len(STATUS_ORDER)])),
+                "logs": f"[{start}] 作业启动\\n[{start}] 正在处理...\\n[{end}] 任务{'完成' if row.get('status') == STATUS_ORDER[-1] else '进行中'}",
+            })
+        return items
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        return store.find(MODULE, entry_id)
+
+    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        missing = [f for f in REQUIRED_FIELDS if not str(values.get(f) or "").strip()]
+        if missing:
+            return None, missing
+        rows = store.rows(MODULE)
+        entry = {"id": max((int(r.get("id", 0)) for r in rows), default=0) + 1}
+        entry.update({f: values.get(f) for f in REQUIRED_FIELDS})
+        entry["status"] = STATUS_ORDER[0]
+        entry["pending"] = True
+        entry["abnormal"] = False
+        rows.append(entry)
+        return entry, []
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        entry = store.find(MODULE, entry_id)
+        if entry is None:
+            return None, f"__ENTITY__ {entry_id} 不存在或已归档"
+        if action not in ACTION_RULES:
+            return None, f"动作「{action}」不属于__NAME__可执行范围"
+        target = ACTION_RULES[action]
+        entry["status"] = target
+        entry["pending"] = target != STATUS_ORDER[-1]
+        entry["abnormal"] = action in NEGATIVE_ACTIONS
+        return entry, f"__ENTITY__已{action}"
+'''
+
+ROUTER_ANALYSIS_PY = '''\
+"""__NAME__ 分析看板接口：汇总指标、参数运行与结果导出。"""
+from __future__ import annotations
+
+import csv
+import io
+import random
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+
+from app.schemas import ActionPayload, ActionResult, EntryPayload
+from app.services.__KEY__ import __CLASS__Service
+
+router = APIRouter(prefix="/api/__KEY__", tags=["__NAME__"])
+service = __CLASS__Service()
+LIST_FIELDS = __FIELDS__
+STATUSES = __STATUSES__
+
+
+def csv_cell(value: Any) -> str:
+    text = str(value) if value is not None else ""
+    if text and text[0] in "=+-@":
+        text = "'" + text
+    return '"' + text.replace('"', '""') + '"'
+
+
+@router.get("/summary")
+def get_summary() -> dict[str, Any]:
+    return {"metrics": [
+        {"label": "覆盖数据源", "value": random.randint(12, 45), "trend": random.randint(-12, 25)},
+        {"label": "最新指标值", "value": round(random.uniform(0.72, 0.99), 3), "trend": random.randint(-8, 15)},
+        {"label": "异常记录", "value": random.randint(0, 8), "trend": -random.randint(1, 10)},
+    ]}
+
+
+@router.get("")
+def list_results() -> dict[str, Any]:
+    return {"items": service.list_results()}
+
+
+@router.post("/run")
+def run_analysis(payload: EntryPayload) -> dict[str, Any]:
+    results = service.run_analysis(payload.values)
+    return {"items": results}
+
+
+@router.get("/export")
+def export_entries() -> StreamingResponse:
+    items = service.list_results()
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    all_keys = ["id"]
+    if items:
+        all_keys = list(items[0].keys())
+    writer.writerow(all_keys)
+    for item in items:
+        writer.writerow([csv_cell(item.get(k, "")) for k in all_keys])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv; charset=utf-8",
+                             headers={"Content-Disposition": "attachment; filename=__KEY__.csv"})
+
+
+@router.get("/{entry_id}")
+def get_entry(entry_id: int) -> dict:
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"__ENTITY__ {entry_id} 不存在")
+    return entry
+'''
+
+SERVICE_ANALYSIS_PY = '''\
+"""__NAME__ 分析看板服务：汇总指标、运行分析并生成模拟结果。"""
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from app.store import store
+
+MODULE = "__KEY__"
+REQUIRED_FIELDS = __REQUIRED_FIELDS__
+STATUS_ORDER = __STATUSES__
+ACTION_RULES = __ACTION_RULES__
+NEGATIVE_ACTIONS = __NEGATIVE_ACTIONS__
+
+
+class __CLASS__Service:
+    def list_results(self) -> list[dict[str, Any]]:
+        rows = store.rows(MODULE)
+        results: list[dict] = []
+        for row in rows:
+            d = dict(row)
+            d["指标值"] = round(random.uniform(0.65, 0.98), 3)
+            d["对比基准"] = round(random.uniform(0.60, 0.92), 3)
+            d["差异"] = round(d["指标值"] - d["对比基准"], 3)
+            results.append(d)
+        return results
+
+    def run_analysis(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        count = int(params.get("样本范围", params.get("并行数量", "6")))
+        results: list[dict] = []
+        for i in range(count):
+            results.append({
+                "id": i + 1,
+                "分组": f"分组{(i%3)+1}",
+                "指标值": round(random.uniform(0.62, 1.02), 3),
+                "对比基准": round(random.uniform(0.58, 0.95), 3),
+                "差异": round(random.uniform(-0.2, 0.3), 3),
+            })
+        return results
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        return store.find(MODULE, entry_id)
+'''
+
 BACKEND_SEED = '''\
 """示例数据：每个模块给几条不同状态的记录，方便起服务后立刻看到内容。"""
 from __future__ import annotations
@@ -3549,6 +4192,27 @@ def build_local_seed_blocks(modules: list[dict]) -> str:
     return "export const SEED_ROWS: Record<string, EntryRow[]> = {\n" + "\n".join(blocks) + "\n}"
 
 
+def _pick_page_template(module: dict, frontend_only: bool, **render_kw: object) -> str:
+    """根据模块的 page_shape 选择对应的页面模板。
+
+    crud-table → 现有列表模板
+    dag-graph → DAG 拓扑图
+    job-timeline → 作业时间线
+    analysis-dashboard → 分析看板
+    纯前端模式下非 crud-table 回退到 crud-table。
+    """
+    shape = module.get("page_shape", "crud-table")
+    if frontend_only and shape != "crud-table":
+        shape = "crud-table"
+    template = {
+        "crud-table": VUE_VIEW_LOCAL if frontend_only else VUE_VIEW,
+        "dag-graph": VUE_DAG_GRAPH,
+        "job-timeline": VUE_JOB_TIMELINE,
+        "analysis-dashboard": VUE_ANALYSIS_DASHBOARD,
+    }.get(shape, VUE_VIEW)
+    return render(template, **render_kw)
+
+
 def gen_frontend_vue(spec: dict, out: Path) -> int:
     modules = spec["modules"]
     frontend_only = spec["backend"] == "none"
@@ -3610,15 +4274,12 @@ def gen_frontend_vue(spec: dict, out: Path) -> int:
         routes.append(
             "    { path: '" + f"/{key}" + "', name: '" + key + "', component: " + cls + " },"
         )
-        files[fe / f"src/views/{key}/index.vue"] = render(
-            VUE_VIEW_LOCAL if frontend_only else VUE_VIEW,
-            KEY=key, NAME=module["name"], ENTITY=module["entity"],
-            DESC=module_desc(module),
-            FIELDS=ts_array(module["fields"]),
-            ACTIONS=ts_array(module.get("actions") or [f"提交{module['name']}"]),
-            STATUSES=ts_array(module.get("statuses") or ["待处理", "处理中", "已完成"]),
-            METRICS_NAMES=json.dumps(module_metrics(module), ensure_ascii=False),
-        )
+        files[fe / f"src/views/{key}/index.vue"] = _pick_page_template(
+            module, frontend_only, key=key, name=module["name"], entity=module["entity"],
+            desc=module_desc(module), fields=ts_array(module["fields"]),
+            actions=ts_array(module.get("actions") or [f"提交{module['name']}"]),
+            statuses=ts_array(module.get("statuses") or ["待处理", "处理中", "已完成"]),
+            metrics_names=json.dumps(module_metrics(module), ensure_ascii=False))
     files[fe / "src/router/index.ts"] = render(
         ROUTER_TS, VIEW_IMPORTS="\n".join(view_imports), ROUTES="\n".join(routes))
 
@@ -3790,8 +4451,17 @@ def gen_backend_python(spec: dict, out: Path) -> int:
         flow = module_actions(module)
         statuses = flow["statuses"]
         actions = flow["actions"]
+        shape = module.get("page_shape", "crud-table")
+        if shape == "dag-graph":
+            router_tpl, service_tpl = ROUTER_DAG_PY, SERVICE_DAG_PY
+        elif shape == "job-timeline":
+            router_tpl, service_tpl = ROUTER_TIMELINE_PY, SERVICE_TIMELINE_PY
+        elif shape == "analysis-dashboard":
+            router_tpl, service_tpl = ROUTER_ANALYSIS_PY, SERVICE_ANALYSIS_PY
+        else:
+            router_tpl, service_tpl = ROUTER_PY, SERVICE_PY
         files[be / f"app/routers/{key}.py"] = render(
-            ROUTER_PY,
+            router_tpl,
             KEY=key, NAME=module["name"], ENTITY=module["entity"], CLASS=cls,
             FIELDS=py_list(module["fields"]),
             STATUSES=py_list(statuses),
@@ -3800,7 +4470,7 @@ def gen_backend_python(spec: dict, out: Path) -> int:
             STATUS_JOIN="、".join(statuses),
         )
         files[be / f"app/services/{key}.py"] = render(
-            SERVICE_PY,
+            service_tpl,
             KEY=key, NAME=module["name"], ENTITY=module["entity"], CLASS=cls,
             FIELDS=py_list(module["fields"]),
             REQUIRED_FIELDS=py_list(module["fields"][:3]),

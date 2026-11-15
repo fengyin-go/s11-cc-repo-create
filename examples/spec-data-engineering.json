@@ -44,7 +44,8 @@
         "数据源总数",
         "待校验数据源",
         "已启用数据源"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "extractor",
@@ -81,7 +82,8 @@
         "采集游标总数",
         "待校验采集游标",
         "已启用采集游标"
-      ]
+      ],
+      "page_shape": "job-timeline"
     },
     {
       "key": "crawlrule",
@@ -118,7 +120,8 @@
         "抽取规则总数",
         "待校验抽取规则",
         "已启用抽取规则"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "robotflow",
@@ -155,7 +158,8 @@
         "自动化流程总数",
         "待校验自动化流程",
         "已启用自动化流程"
-      ]
+      ],
+      "page_shape": "job-timeline"
     },
     {
       "key": "landing",
@@ -192,7 +196,8 @@
         "落地区段总数",
         "待校验落地区段",
         "已启用落地区段"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "schema",
@@ -229,7 +234,8 @@
         "字段契约总数",
         "待校验字段契约",
         "已启用字段契约"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "cleaning",
@@ -266,7 +272,8 @@
         "清洗规则总数",
         "待校验清洗规则",
         "已启用清洗规则"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "dedup",
@@ -303,7 +310,8 @@
         "去重策略总数",
         "待校验去重策略",
         "已启用去重策略"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "partition",
@@ -340,7 +348,8 @@
         "分区方案总数",
         "待校验分区方案",
         "已启用分区方案"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "transform",
@@ -377,7 +386,8 @@
         "转换节点总数",
         "待校验转换节点",
         "已启用转换节点"
-      ]
+      ],
+      "page_shape": "dag-graph"
     },
     {
       "key": "dimension",
@@ -414,7 +424,8 @@
         "维度实体总数",
         "待校验维度实体",
         "已启用维度实体"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "factset",
@@ -451,7 +462,8 @@
         "事实数据集总数",
         "待校验事实数据集",
         "已启用事实数据集"
-      ]
+      ],
+      "page_shape": "dag-graph"
     },
     {
       "key": "quality",
@@ -488,7 +500,8 @@
         "质量规则总数",
         "待校验质量规则",
         "已启用质量规则"
-      ]
+      ],
+      "page_shape": "crud-table"
     },
     {
       "key": "lineage",
@@ -525,7 +538,8 @@
         "血缘关系总数",
         "待校验血缘关系",
         "已启用血缘关系"
-      ]
+      ],
+      "page_shape": "dag-graph"
     },
     {
       "key": "backfill",
@@ -562,7 +576,8 @@
         "补数批次总数",
         "待校验补数批次",
         "已启用补数批次"
-      ]
+      ],
+      "page_shape": "job-timeline"
     },
     {
       "key": "metric",
@@ -599,7 +614,8 @@
         "指标定义总数",
         "待校验指标定义",
         "已启用指标定义"
-      ]
+      ],
+      "page_shape": "analysis-dashboard"
     },
     {
       "key": "analysis",
@@ -636,7 +652,8 @@
         "分析方案总数",
         "待校验分析方案",
         "已启用分析方案"
-      ]
+      ],
+      "page_shape": "analysis-dashboard"
     },
     {
       "key": "delivery",
@@ -673,7 +690,8 @@
         "服务版本总数",
         "待校验服务版本",
         "已启用服务版本"
-      ]
+      ],
+      "page_shape": "crud-table"
     }
   ]
 }
