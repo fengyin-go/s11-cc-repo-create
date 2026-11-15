@@ -500,6 +500,13 @@ htmlcov/
 # ===== 操作系统 =====
 .DS_Store
 .AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+
+# ===== 技能元数据（本地生成物，不入仓库） =====
+.s11-domain.json
+.s11-spec.json
 Thumbs.db
 desktop.ini
 
