@@ -889,6 +889,7 @@ test('时间线模块：甘特条渲染、日期筛选、日志查看、登记',
 
   for (const mod of timelineModules) {
     await page.goto(`/${mod.key}`)
+    await expect(page.locator('.timeline-bar').first()).toBeVisible({ timeout: 10000 })
     const bars = page.locator('.timeline-bar')
     const count = await bars.count()
     expect(count).toBeGreaterThanOrEqual(3)
