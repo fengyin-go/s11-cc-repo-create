@@ -42,7 +42,7 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 | `domain` | ✓ | 固定 `数据工程`，缺失或其他领域会被拒绝 |
 | `subdirection` | ✓ | 上述三个准确值任选一个 |
 | `app_name` | ✓ | 应用中文名，进标题、README、页面头部 |
-| `app_slug` | ✓ | 英文短名，做包名与前端 package name；只能用字母数字与连字符 |
+| `app_slug` | ✓ | 英文短名，做包名与前端 package name；小写字母开头，只含小写字母、数字与连字符 |
 | `app_desc` | ✓ | 一句话业务描述，进页面头部与 README |
 | `frontend` | | `vue`（默认）或 `react`，可被 `--frontend` 覆盖 |
 | `backend` | | `python`（默认，FastAPI）、`java`（Spring Boot 17），或 `none`（**纯前端仓库**，不生成后端）；可被 `--backend` 覆盖 |
@@ -68,14 +68,14 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `key` | ✓ | 英文小写标识；同时是目录名、接口前缀、主体名。**不能与内置名撞车后又按名字导入**（生成器已用别名导入规避，但别用 Python 关键字）；**也不能叫 `dist` / `build` / `out` / `target` / `coverage` / `logs` / `node_modules` 这些依赖与构建产物目录名**——它会变成 `frontend/src/views/<key>/`，被 `.gitignore` 吃掉，页面进不了仓库（生成前会直接拒，见 `RESERVED_MODULE_KEYS`） |
+| `key` | ✓ | 目录名、接口前缀与主体名；必须匹配 `^[a-z][a-z0-9_]*$`，不能是 Python 关键字、保留构建目录或 `health` / `overview` 系统端点；类名归一化后也不能互相冲突 |
 | `name` | ✓ | 模块中文名，进页面标题与导航 |
 | `entity` | ✓ | 业务对象中文名，进按钮与提示语 |
-| `fields` | ✓ | 业务字段中文名，**至少 3 个**（既是表格列，也是主体识别要用的中文串） |
-| `statuses` | ✓ | 状态枚举；第一条是新建时的默认状态 |
-| `actions` | ✓ | 可执行动作，进前端按钮与后端动作接口 |
-| `action_targets` | | 与 `actions` 一一对应的目标状态；不写就按 `statuses` 顺序往后推一格 |
-| `metrics` | | 页面顶部三张指标卡的名字 |
+| `fields` | ✓ | 至少 3 个不重复的非空字段；页面查询、完整登记与 CSV 导出共用这组字段 |
+| `statuses` | ✓ | 至少 2 个不重复状态；第一条是新建时的默认状态 |
+| `actions` | ✓ | 至少 1 个不重复动作，进前端按钮与后端动作接口 |
+| `action_targets` | | 与 `actions` 一一对应且必须属于 `statuses`；不写就按状态顺序往后推一格 |
+| `metrics` | | 如填写必须正好 3 项；数值由当前数据动态计算，不再是固定常量 |
 | `desc` | | 覆盖自动生成的页面说明 |
 
 ## 怎么写出「撑得起 30 条」的 spec
@@ -101,13 +101,16 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 │   ├── src/api/client.ts               统一请求封装
 │   ├── src/stores/session.ts           会话状态（React 版省略）
 │   ├── vite.config.ts                  server.open = false
-│   └── package.json / index.html / tsconfig.json
+│   ├── tests/functionality.spec.ts      全模块浏览器功能验收
+│   ├── playwright.config.ts            Chromium E2E 配置
+│   └── package.json / package-lock.json / index.html / tsconfig.json
 ├── backend/                  FastAPI 或 Spring Boot
 │   ├── app/routers/<key>.py            每个模块一组接口（主体 = <key>）
 │   ├── app/services/<key>.py           状态流转与字段校验
 │   ├── app/store.py / seed.py          内存仓库与示例数据
 │   └── requirements.txt / run.sh
 ├── .gitignore
+├── .s11-domain.json / .s11-spec.json  领域与规范化业务快照（供验收和跨仓库查重）
 ├── README.md
 ├── docker-compose.yml
 └── Makefile
@@ -128,6 +131,7 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 │   ├── src/data/types.ts               公共类型
 │   └── vite.config.ts                  server.open = false，且**没有 /api 代理**
 ├── .gitignore
+├── .s11-domain.json / .s11-spec.json  领域与规范化业务快照（供验收和跨仓库查重）
 ├── README.md
 ├── docker-compose.yml                  只有 frontend 一个 service
 └── Makefile

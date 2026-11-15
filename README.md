@@ -6,7 +6,8 @@
 - Vue/React 前端，Python/Java 后端，或带本地数据层的纯前端形态。
 - 默认示例 `examples/spec-data-engineering.json`，18 个数据工程模块。
 - 默认发布账号 `fengyin-go`，每台电脑通过 `config/github.local.json` 配置 owner/account，凭证从该电脑的 gh 登录读取。
-- 生成、静态验收、干净克隆启动验收与发布链路保留。
+- 整批/历史跨仓库查重、原子生成、静态功能契约、干净克隆启动、Playwright 全功能 E2E 与 HEAD 绑定发布证据。
+- 查询、登记、状态动作、筛选 CSV 导出和动态指标均有逐模块浏览器断言；前端依赖携带锁文件。
 
 ```bash
 python3 scripts/github_settings.py

@@ -1,7 +1,7 @@
 # 硬性要求与容量口径
 
-这个 skill 生成的每个仓库都要过 G0～G7 静态闸门，全部由 `scripts/verify_repo.py` 机器复核，
-再加一道 `scripts/probe_startup.py` 的真启动复核。任何一道不过就不算生成完成。
+这个 skill 生成的每个仓库都要过 G0～G7 静态闸门与 G8 功能契约前置，全部由 `scripts/verify_repo.py` 机器复核；
+再由 `scripts/probe_startup.py` 做干净克隆真启动和浏览器全功能 E2E，由 `scripts/check_similarity.py` 做 G9 跨仓库查重。任何一道不过就不算生成完成。
 
 | 闸门 | 要求 | 由谁判 |
 |---|---|---|
@@ -13,7 +13,8 @@
 | G5 容量 | 出题容量 >= 30 条 | `verify_repo.py` |
 | G6 合规 | 不是禁用题型仓库，无密钥、无超大文件、无违规业务域，且题域不命中 0731 严禁出题清单 | `verify_repo.py` |
 | G7 环境 | 基础环境自洽：Python 全量可编译、后端入口能 import、依赖都声明、没有写死本机路径 | `verify_repo.py` |
-| G8 真启动 | 干净克隆里后端起得来、接口有数据、前端页面有挂载点、前端代理到后端通、生产构建通过；纯前端仓库没有后端，后端与代理两步记「跳过」不算失败 | `probe_startup.py` |
+| G8 功能 | 静态逐模块功能契约；干净克隆里装依赖、起服务、验接口/代理、跑全模块浏览器 E2E、生产构建；纯前端跳过不存在的后端/代理，但须验 localStorage 持久化；进程和临时克隆均清理 | `verify_repo.py` + `probe_startup.py` |
+| G9 差异 | 整批 spec 与历史业务指纹预检，生成后再比较规范化业务源码；相同或超过相似度阈值的仓库拒绝交付 | `check_similarity.py` |
 
 ## G7 基础环境自洽（专治「本地能跑、换台机器就炸」）
 
@@ -41,9 +42,21 @@ python3 scripts/probe_startup.py --repo <repo> --clean-clone --build
 2. 仓库里没有「未提交但必需」的文件（克隆出来的工作区是干净的）；
 3. 现场装依赖就能起来，不靠任何本地残留。
 
-通过的判据：后端 `/api/health`、`/api/overview` 与一个业务接口都 200；前端首页含挂载点、
-入口脚本可加载；从前端端口走 `/api/health` 返回 200（代理链路通）；`--build` 时
-`npm run build` 退出码 0；结束时 `cleaned_up: true`（进程全停）。
+通过的判据：后端 `/api/health`、`/api/overview` 与业务接口正常；前端首页和入口脚本可加载；
+全栈从前端端口走 `/api/health` 返回 200。随后 Playwright 逐模块真实点击：查询命中、无结果、重置、
+筛选后 CSV 下载与内容解析、完整登记、每个动作后的目标状态、指标变化；纯前端刷新后仍保留登记数据。
+浏览器脚本错误或 `/api` 4xx/5xx 都算失败。`--build` 时 `npm run build` 退出码 0；
+结束时 `cleaned_up: true`（进程全停），临时克隆目录删除，日志复制到源仓库外层 `.probe-logs/`。
+
+## G9 跨仓库查重
+
+```bash
+python3 scripts/check_similarity.py --parent <parent> --repo <repo> --json-out <container>/similarity-report.json
+```
+
+业务指纹忽略技术栈、端口、app_slug 和模块 key；模块顺序不影响结果。预检覆盖本批全部输入与
+`<parent>/.s11-registry/registry.json`，生成后还比较剥离注释/字面量后的业务源码结构。
+报告必须保留最近邻、分项分数和阈值；没有历史快照的旧仓库不在自动覆盖范围内，需先归档，不能漏报成“全量已查”。
 
 ## 推送到 GitHub（main 分支）
 
@@ -52,8 +65,9 @@ python3 scripts/publish_github.py --repo <repo>                     # dry-run
 python3 scripts/publish_github.py --repo <repo> --execute --confirm PUBLISH
 ```
 
-先决条件与拒绝项（都实测过）：必须是 git 仓库、当前分支是 `main`、工作区干净、
-静态验收通过；**远端 `main` 上有本地没有的提交时拒推，脚本不做强推**。
+先决条件与拒绝项：必须是 git 仓库、当前分支是 `main`、工作区干净、静态验收通过；
+还必须有绑定当前 HEAD 的 `probe-report.json`（含浏览器全功能通过且 cleaned_up=true）与
+`similarity-report.json`（业务指纹一致）。**远端 `main` 上有本地没有的提交时拒推，脚本不做强推**。
 分支已是最新时报 `up-to-date`，不重复推。推完回读远端 `main` 的 SHA 与本地 HEAD 比对。
 
 **生成的仓库必须是 public**（`--visibility` 默认 `public`）：下游容器要能匿名 clone，

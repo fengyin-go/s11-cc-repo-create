@@ -1,6 +1,6 @@
 ---
 name: s11-cc-repo-create
-description: 为 solo11 生成数据工程领域的出题底座仓库，子方向限数据采集、爬虫与RPA，数仓与数据湖，数据分析与数据应用。支持 Vue/React 配 Python/Java 或纯前端；完成静态验收、干净克隆真启动与 GitHub 发布，GitHub owner 和认证账号按机器配置。用于生成仓库、造项目和建立出题底座，不负责题面、模型轨迹或产物验收。
+description: 为 solo11 生成数据工程领域的出题底座仓库，子方向限数据采集、爬虫与RPA，数仓与数据湖，数据分析与数据应用。支持 Vue/React 配 Python/Java 或纯前端；完成跨仓库查重、静态验收、干净克隆启动、浏览器全功能 E2E 与 GitHub 发布，GitHub owner 和认证账号按机器配置。用于生成仓库、造项目和建立出题底座，不负责题面、模型轨迹或产物验收。
 disable-model-invocation: true
 ---
 
@@ -63,7 +63,7 @@ python3 <skill>/scripts/github_settings.py --github-config /path/to/github.json
 
 ## 标准流程
 
-用户要求生成并交付仓库时，默认完整执行：定 spec → 生成 → 静态验收 → 干净克隆真启动 → 发布 GitHub。
+用户要求生成并交付仓库时，默认完整执行：定 spec → 整批/历史查重预检 → 原子生成 → 静态与功能契约验收 → 生成后源码查重 → 干净克隆真启动与浏览器全功能 E2E → 登记指纹 → 发布 GitHub。
 用户明确要求只做本地时不发布。生成或验收通过后继续完成已授权的链路，不额外停下来要求重复确认。
 本技能不写题面、不建 A/B 分支、不跑 Claude，不修改其他出题技能的账号。
 
@@ -92,13 +92,22 @@ python3 <skill>/scripts/run_pipeline.py \
 ```bash
 python3 <skill>/scripts/scaffold_repo.py --parent "/path/to/父目录" --spec /path/to/spec.json --git-init
 python3 <skill>/scripts/verify_repo.py --repo "/path/to/仓库根" --json
-python3 <skill>/scripts/probe_startup.py --repo "/path/to/仓库根" --clean-clone --build
+python3 <skill>/scripts/check_similarity.py --parent "/path/to/父目录" --repo "/path/to/仓库根" --json-out "/path/to/任务容器/similarity-report.json"
+python3 <skill>/scripts/probe_startup.py --repo "/path/to/仓库根" --clean-clone --build --json-out "/path/to/任务容器/probe-report.json"
 python3 <skill>/scripts/publish_github.py --repo "/path/to/仓库根" --execute --confirm PUBLISH
 ```
 
 编号规则保留原逻辑：默认 `cc10001` 起，前缀可用 `--prefix` 改成 2～4 个字母，编号 10001～19999；`s11-` 是技能名前缀，不改变仓库编号格式。
 父目录模式固定生成 `<父目录>/<编号>/<编号>/`：外层是任务容器，内层是仓库根；`--repo` 一律传内层。显式 `--out` 则直接以给定路径为仓库根。
 扫描本地编号并查询配置 owner 下的远端编号，已有编号跳过；`--number` 显式编号冲突就报错。离线可 `--no-github-check`，此时只能声称检查过本地编号。
+
+## 跨仓库不重复 / 不雷同
+
+- 每份仓库保存规范化 `.s11-spec.json`；业务指纹忽略技术栈、端口、app_slug 和模块 key，换壳不能绕过。
+- `run_pipeline.py` 在落盘前先对所有输入和历史仓库做整批预检；同批重复也会拒绝，不产生部分批次。
+- 生成后 `check_similarity.py` 再比较业务语义与规范化业务源码，报告最近邻、分项分数和拒绝原因。
+- 登记册位于 `<parent>/.s11-registry/registry.json`，只登记完成本地验收的仓库。同一父目录的流水线互斥，登记册写入另有文件锁，避免并发预检穿仓；不要为并行绕过互斥，需并行时用不同父目录并在合并前复查。旧仓库没有 `.s11-spec.json` 时无法自动回溯，应先补做人工/脚本归档，不能宣称已覆盖这些旧仓库。
+- 阈值集中在 `scripts/check_similarity.py`；调整前用现有仓库分布做基线并跑 `tests/test_quality.py`，不要为让某批通过而临时放宽。
 
 ## 验收与发布约束
 
@@ -109,16 +118,17 @@ python3 <skill>/scripts/publish_github.py --repo "/path/to/仓库根" --execute 
 - G2 Vite `server.open = false`；G3 `.gitignore` 覆盖依赖、缓存、产物与环境文件。
 - G4 源码至少 2000 行；G5 容量至少 30，公式为 `min(35, 主体数 × 2, 12 × 3)`。
 - G6 无密钥、超大文件与不相关禁用题域；G7 语法、入口、依赖声明和路径可移植。
-- G8 在干净克隆里真装依赖、启动服务、验证接口与前端代理、构建前端；纯前端跳过后端和代理项。结束必须 `cleaned_up: true`。
+- G8 前置检查逐模块功能锚点、创建/查询/动作/CSV 契约、锁文件与 E2E 资产；随后在干净克隆里真装依赖、启动服务、验证接口与前端代理、执行浏览器全功能测试并构建前端。测试逐模块覆盖查询命中/无结果/重置、筛选导出解析、完整登记、每个动作的状态变化和指标；纯前端另验刷新持久化。结束必须 `cleaned_up: true`，临时克隆必须删除。
+- G9 跨仓库查重：整批 spec 预检 + 生成后业务源码复核，通过后才登记和发布。
 
 s11 明确允许「数据分析与数据应用」，因此原规则的 `streamlit` / `csv-dashboard` / `报表统计` 不再作为禁用关键词。数据工程业务仍需落地，不能靠静态图表凑容量。技术栈限制保持 Vue/React，放开领域关键词并不增加 Streamlit 生成器。其余禁用方向保留，完整表见 `scripts/repo_rules.py`。
 
-真实网页验收优先使用内置浏览器。探针只能证明其报告列出的接口、入口和构建结果，不能替代对实际页面与业务规则的检查。
-长任务持续跟踪到结束，向用户报告有意义的进展；失败先修复，必要时报告具体阻塞。`--skip-probe` 仅供开发脚本时的局部检查，不能作为完整交付证据。
+真实网页验收由生成仓库自带的 Playwright 用例执行，并检查浏览器脚本错误与 `/api` 4xx/5xx。报告只能证明其中列出的功能，不再把首页 HTML 或健康检查当作全功能可用证据。
+长任务持续跟踪到结束，向用户报告有意义的进展；失败先修复，必要时报告具体阻塞。`--skip-probe` / `--skip-e2e` 仅供本地调试；`--publish` 与 `--skip-probe` 互斥，发布器还会核验绑定当前 HEAD 的 `probe-report.json` 与 `similarity-report.json`。
 
 发布默认公开仓库、main 分支。要求工作区干净、静态验收通过；远端分叉拒推，不强推。
 使用配置账号的凭证做 gh 与 git 请求；origin 不带 token，认证 header 只供当次命令使用。
-推送后核对远端 main SHA 与本地 HEAD，并复核真实可见性。现有远端可见性不符合请求时，发布器会调整并在报告记录；不要向未经授权的现有仓库发布。
+推送后核对远端 main SHA 与本地 HEAD，并复核真实可见性。现有远端可见性不符合请求时先记录计划，只有证据、分叉等前置检查全通过后才实际调整；不要向未经授权的现有仓库发布。
 `--remote-url` 仅供非 GitHub 远端或本地裸仓库测试，不作为绕过 GitHub owner 配置的通道。
 
 交付报告至少列仓库根、领域/子方向、体量/容量、静态与启动实测结果、GitHub URL、owner/认证账号、远端 SHA 对齐结果；未执行项如实注明。
@@ -129,5 +139,5 @@ s11 明确允许「数据分析与数据应用」，因此原规则的 `streamli
 python3 -m unittest discover -s <skill>/tests -v
 ```
 
-用例覆盖原生成与验收、编号、纯前端、可见性、流水线、本地裸仓库推送，以及 s11 领域限制与账号选择。
+用例覆盖生成与验收、编号、纯前端、可见性、流水线、本地裸仓库推送、spec 预检、跨仓库相同/雷同反例、功能契约、HEAD 证据，以及 s11 领域限制与账号选择。
 测试不创建 GitHub 仓库；真实账号有效性单独用 `github_settings.py` 检查。

@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-GATE_VERSION = "s11-cc-repo-create-2026-11-11"
+GATE_VERSION = "s11-cc-repo-create-2026-11-15-functional-similarity-v2"
 
 # ---------------------------------------------------------------------------
 # 源码扫描模式：只有命中这些模式的文件才会被当成「可独立出题的主体」。

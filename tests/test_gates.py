@@ -56,7 +56,20 @@ def generate(target: Path, *extra: str) -> dict:
     )
     if result.returncode != 0:
         raise AssertionError(f"生成失败：{result.stderr}")
-    return json.loads(result.stdout)
+    payload = json.loads(result.stdout)
+    # 发布单测使用本地裸仓库，不跑昂贵 E2E；写入与真实探针同结构的有效证据。
+    if (target / ".git").exists():
+        head = git("-C", str(target), "rev-parse", "HEAD").stdout.strip()
+        (target.parent / "probe-report.json").write_text(json.dumps({
+            "ok": True, "source_head": head, "cleaned_up": True,
+            "steps": [{"step": "克隆内：浏览器全功能验收", "ok": True}],
+        }), encoding="utf-8")
+        spec = json.loads((target / ".s11-spec.json").read_text(encoding="utf-8"))
+        import check_similarity
+        (target.parent / "similarity-report.json").write_text(json.dumps({
+            "ok": True, "source_head": head, "fingerprint": check_similarity.fingerprint(spec),
+        }), encoding="utf-8")
+    return payload
 
 
 class ScaffoldAndVerify(unittest.TestCase):
@@ -122,17 +135,20 @@ class ScaffoldAndVerify(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["checks"]["gitignore"]["ok"])
 
-    def test_small_repo_fails_size_gate(self):
+    def test_code_size_gate_rejects_when_minimum_is_not_met(self):
+        result = verifier.verify(self.repo, min_lines=999999, min_capacity=30, per_mode=3, per_subject=2)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("G4 代码量不足" in failure for failure in result["failures"]))
+
+    def test_small_spec_is_refused_before_generation(self):
         spec = json.loads(SPEC.read_text(encoding="utf-8"))
         spec["modules"] = spec["modules"][:3]
         small_spec = self.tmp / "small-spec.json"
         small_spec.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
         target = self.tmp / "small"
-        generate(target, "--spec", str(small_spec))
-        result = self.verify(target)
-        self.assertFalse(result["ok"])
-        self.assertTrue(any("G4 代码量不足" in failure for failure in result["failures"]),
-                        msg=result["failures"])
+        with self.assertRaisesRegex(AssertionError, "至少包含 16 个模块"):
+            generate(target, "--spec", str(small_spec))
+        self.assertFalse(target.exists())
 
     def test_capacity_gate_rejects_few_subjects(self):
         """主体不够时容量必然够不到 30 条，闸门要拦下。"""
@@ -261,6 +277,12 @@ class ScaffoldAndVerify(unittest.TestCase):
             (repo / "README.md").read_text(encoding="utf-8") + "\n说明补充\n", encoding="utf-8")
         git("-C", str(repo), "-c", "user.email=a@b", "-c", "user.name=a",
             "commit", "-qam", "docs: 补充说明")
+        head = git("-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+        for name in ("probe-report.json", "similarity-report.json"):
+            path = repo.parent / name
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["source_head"] = head
+            path.write_text(json.dumps(payload), encoding="utf-8")
         report = publisher.publish(publish_args(repo=str(repo), remote_url=str(bare),
                                                 execute=True, confirm="PUBLISH"))
         self.assertTrue(report["ok"], msg=report.get("problems"))
@@ -656,7 +678,7 @@ class BannedTopics(unittest.TestCase):
         self.assertIn("电商", result.stdout)
 
     def test_clean_spec_passes_check_spec(self):
-        result = self.check_spec(self.write_spec("clean.json", dict(self.CLEAN_MODULE)))
+        result = self.check_spec(SPEC)
         self.assertEqual(result.returncode, 0, msg=result.stdout)
         self.assertTrue(json.loads(result.stdout)["ok"])
 
@@ -933,10 +955,11 @@ class PipelineTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def pipeline(self, *extra: str):
-        return subprocess.run(
-            [sys.executable, str(SCRIPTS / "run_pipeline.py"), "--parent", str(self.tmp / "gen"),
-             "--no-github-check", "--skip-probe", *extra],
-            capture_output=True, text=True, check=False)
+        command = [sys.executable, str(SCRIPTS / "run_pipeline.py"), "--parent", str(self.tmp / "gen"),
+                   "--no-github-check"]
+        if "--publish" not in extra:
+            command.append("--skip-probe")
+        return subprocess.run([*command, *extra], capture_output=True, text=True, check=False)
 
     def test_pipeline_runs_generate_and_verify_into_nested_layout(self):
         result = self.pipeline("--spec", str(SPEC))
@@ -969,34 +992,46 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse((self.tmp / "gen" / "cc10001" / "cc10001" / "backend").exists())
         self.assertTrue((self.tmp / "gen" / "cc10001" / "cc10001" / "frontend" / "package.json").is_file())
 
+    def test_pipeline_rejects_duplicate_specs_before_generation(self):
+        result = self.pipeline("--spec", str(SPEC), "--spec", str(SPEC))
+        self.assertNotEqual(result.returncode, 0)
+        report = json.loads(result.stdout[result.stdout.index("{"):])
+        self.assertEqual(report["stage"], "批量预检")
+        self.assertFalse((self.tmp / "gen" / "cc10001").exists())
+
+    def test_pipeline_forbids_skipping_probe_when_publishing(self):
+        result = subprocess.run([
+            sys.executable, str(SCRIPTS / "run_pipeline.py"), "--parent", str(self.tmp / "gen"),
+            "--spec", str(SPEC), "--no-github-check", "--skip-probe",
+            "--publish", "--confirm", "PUBLISH",
+        ], capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("禁止同时使用", result.stderr)
+        self.assertFalse((self.tmp / "gen" / "cc10001").exists())
+
     def test_pipeline_refuses_publish_without_confirmation(self):
         result = self.pipeline("--spec", str(SPEC), "--publish")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--confirm PUBLISH", result.stderr)
         self.assertFalse((self.tmp / "gen").exists(), "参数被拒时不该落下任何仓库")
 
-    def test_pipeline_stops_early_when_a_spec_is_refused(self):
-        """第一份命中严禁题域就停，默认不硬撑着跑后面那份。"""
+    def test_pipeline_preflight_refuses_invalid_spec_without_partial_generation(self):
+        """所有输入先预检；首份违规时不会留下部分批次。"""
         result = self.pipeline("--spec", str(BANNED_SPEC), "--spec", str(SPEC))
         self.assertNotEqual(result.returncode, 0)
         report = json.loads(result.stdout[result.stdout.index("{"):])
         self.assertFalse(report["ok"])
-        self.assertTrue(report["stopped_early"])
-        self.assertEqual(report["specs_done"], 1)
-        self.assertEqual(report["repos"][0]["failed_step"], "生成")
-        # 失败原因要带上命中点（reason 会截断，认关键字即可）
-        self.assertIn("库存", report["repos"][0]["reason"])
-        # 被拒的 spec 不落目录，第二份也没被生成
+        self.assertEqual(report["stage"], "批量预检")
+        self.assertIn("库存", report["reason"])
+        self.assertFalse((self.tmp / "gen" / "cc10001").exists())
         self.assertFalse((self.tmp / "gen" / "cc10002").exists())
 
-    def test_pipeline_keep_going_runs_the_rest(self):
+    def test_pipeline_keep_going_does_not_bypass_preflight(self):
         result = self.pipeline("--spec", str(BANNED_SPEC), "--spec", str(SPEC), "--keep-going")
         self.assertNotEqual(result.returncode, 0)
         report = json.loads(result.stdout[result.stdout.index("{"):])
-        self.assertEqual(report["specs_done"], 2)
-        self.assertFalse(report["stopped_early"])
-        self.assertFalse(report["repos"][0]["ok"])
-        self.assertTrue(report["repos"][1]["ok"])
+        self.assertEqual(report["stage"], "批量预检")
+        self.assertFalse((self.tmp / "gen" / "cc10001").exists())
 
     def test_pipeline_publishes_to_a_remote_and_confirms_sha(self):
         """推送这一步真的接上了：推到本地裸仓库，远端 main 的 SHA 必须等于本地 HEAD。"""

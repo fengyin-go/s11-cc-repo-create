@@ -18,8 +18,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import fcntl
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -28,10 +29,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import github_settings
+import scaffold_repo
+import check_similarity
 
 SCAFFOLD = SCRIPT_DIR / "scaffold_repo.py"
 VERIFY = SCRIPT_DIR / "verify_repo.py"
 PROBE = SCRIPT_DIR / "probe_startup.py"
+SIMILARITY = SCRIPT_DIR / "check_similarity.py"
 PUBLISH = SCRIPT_DIR / "publish_github.py"
 
 
@@ -58,7 +62,10 @@ def _extract_json(text: str) -> dict:
 
 def _run(step: str, cmd: list[str]) -> dict:
     """跑一个子脚本，拿它的 JSON 报告；退出码非 0 就抛 StepFailed。"""
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=7200)
+    except subprocess.TimeoutExpired:
+        raise StepFailed(step, "子步骤超过 7200 秒，已停止；请查看对应日志与网络/依赖状态") from None
     combined = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
     try:
         payload = _extract_json(combined)
@@ -109,14 +116,7 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int) -
         "lines_written": scaffold["lines_written"],
     })
     record["steps"]["生成"] = True
-    # 将 spec 复制到外层容器目录，保留元信息对照
-    container = scaffold["project"].get("container")
-    if container:
-        dest = Path(container) / spec_path.name
-        shutil.copy2(spec_path, dest)
-        # 复制完成后清理 parent 目录下的原始文件
-        if spec_path.parent.samefile(args.parent):
-            spec_path.unlink()
+    # 规范化 spec 由 scaffold 写入仓库并复制到外层容器；这里不重复复制、不删除输入。
     log("生成", f"{record['project_id']} {record['app_name']}"
                 f"（{record['kind']}）-> {repo_root}")
 
@@ -131,7 +131,19 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int) -
     log("静态验收", f"通过（形态 {verify.get('kind')}，出题容量 {record['capacity']} 条 / "
                     f"主体 {record['subject_count']} 个 / {record['code_lines']} 行）")
 
-    # 3) 干净克隆真启动
+    # 3) 生成后查重：除 spec 外，再比较规范化业务源码，并保存最近邻证据。
+    similarity = _run("跨仓库查重", [
+        sys.executable, str(SIMILARITY), "--parent", str(args.parent), "--repo", str(repo_root),
+    ])
+    record["steps"]["跨仓库查重"] = True
+    record["similarity"] = {"nearest": similarity.get("nearest"), "history_count": similarity.get("history_count")}
+    container = scaffold["project"].get("container")
+    if container:
+        Path(container, "similarity-report.json").write_text(
+            json.dumps(similarity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    log("跨仓库查重", f"通过（历史 {similarity.get('history_count')} 个）")
+
+    # 4) 干净克隆真启动
     if args.skip_probe:
         record["steps"]["真启动验收"] = "skipped"
         log("真启动验收", "已按 --skip-probe 跳过")
@@ -145,8 +157,19 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int) -
         record["steps"]["真启动验收"] = True
         record["cleaned_up"] = probe.get("cleaned_up")
         log("真启动验收", f"通过（进程清理 {probe.get('cleaned_up')}）")
+        if container:
+            Path(container, "probe-report.json").write_text(
+                json.dumps(probe, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    # 4) 推 GitHub
+    # 只登记已经完成本地验收的仓库；发布失败时仍可从现有仓库续推，不重复造题。
+    registered = _run("登记业务指纹", [
+        sys.executable, str(SIMILARITY), "--parent", str(args.parent), "--repo", str(repo_root),
+        "--record", "--project-id", str(record["project_id"]),
+    ])
+    record["steps"]["登记业务指纹"] = True
+    record["registry"] = registered.get("recorded", {}).get("registry")
+
+    # 5) 推 GitHub
     if not args.publish:
         record["steps"]["推送 GitHub"] = "skipped"
         log("推送 GitHub", "未加 --publish，只做本地预演")
@@ -177,7 +200,10 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int) -
     record["ok"] = bool(
         record["steps"]["生成"] is True
         and record["steps"]["静态验收"] is True
-        and record["steps"]["真启动验收"] in (True, "skipped")
+        and record["steps"]["跨仓库查重"] is True
+        and record["steps"]["真启动验收"] is True
+        and record.get("cleaned_up") is True
+        and record["steps"]["登记业务指纹"] is True
         and record["steps"]["推送 GitHub"] is True
         # 非 GitHub 远端（本地裸仓库 / GitLab）没有可见性概念，不参与判定
         and (args.remote_url or record.get("visibility_after") == args.visibility)
@@ -220,6 +246,8 @@ def main() -> int:
 
     if args.publish and args.confirm != "PUBLISH":
         parser.error("--publish 需要配合 --confirm PUBLISH")
+    if args.publish and args.skip_probe:
+        parser.error("发布必须完成干净克隆真启动与功能验收，禁止同时使用 --publish 和 --skip-probe")
 
     specs = [Path(s).expanduser().resolve() for s in args.spec]
     for spec in specs:
@@ -228,6 +256,43 @@ def main() -> int:
 
     parent = Path(args.parent).expanduser().resolve()
     parent.mkdir(parents=True, exist_ok=True)
+    lock_dir = parent / ".s11-registry"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    pipeline_lock = (lock_dir / "pipeline.lock").open("a+")
+    try:
+        fcntl.flock(pipeline_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps({"ok": False, "stage": "流水线互斥",
+                          "reason": f"父目录 {parent} 已有另一个生成流水线在运行，请等待其完成"},
+                         ensure_ascii=False, indent=2))
+        return 2
+
+    def release_pipeline_lock() -> None:
+        fcntl.flock(pipeline_lock.fileno(), fcntl.LOCK_UN)
+        pipeline_lock.close()
+    atexit.register(release_pipeline_lock)
+
+    # 整批预检先完成：任何一个输入与历史或同批其他输入雷同，都不生成/发布部分批次。
+    preflight_history = check_similarity.discover_history(parent)
+    preflight_reports = []
+    for spec_path in specs:
+        try:
+            normalized = scaffold_repo.load_spec(spec_path, args.frontend, args.backend)
+        except SystemExit as exc:
+            print(json.dumps({"ok": False, "stage": "批量预检", "spec": str(spec_path), "reason": str(exc)},
+                             ensure_ascii=False, indent=2))
+            return 2
+        result = check_similarity.evaluate(normalized, preflight_history)
+        preflight_reports.append({"spec": str(spec_path), **result})
+        if not result["ok"]:
+            print(json.dumps({"ok": False, "stage": "批量预检", "reports": preflight_reports},
+                             ensure_ascii=False, indent=2))
+            return 2
+        preflight_history.append({
+            "project_id": f"本批输入:{spec_path.name}", "spec": normalized,
+            "fingerprint": result["fingerprint"],
+        })
+    print(f"批量预检通过：{len(specs)} 份 spec，历史仓库 {len(check_similarity.discover_history(parent))} 个", flush=True)
 
     total = len(specs)
     repos: list[dict] = []

@@ -95,7 +95,26 @@ def spawn(command: list[str], cwd: Path, log_path: Path, env: dict[str, str] | N
         command, cwd=cwd, stdout=handle, stderr=subprocess.STDOUT,
         start_new_session=True, env=environment,
     )
+    handle.close()  # 子进程持有自己的文件描述符，父进程不保留泄漏句柄。
     return process, handle
+
+
+def run_command(command: list[str], *, cwd: Path, timeout: float,
+                env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """同步子命令统一限时，超时返回可记录的 124 而不是无限卡住流水线。"""
+    try:
+        return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(command, 124, "", f"命令超过 {timeout:g} 秒，已终止")
+
+
+def emit(report: dict[str, object], args) -> None:
+    text = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    if getattr(args, "json_out", None):
+        path = Path(args.json_out).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    print(text, end="")
 
 
 def detect_backend(repo: Path) -> dict[str, object]:
@@ -207,12 +226,11 @@ def discover_business_endpoints(backend_dir: Path | None) -> list[str]:
 
 
 def run_clean_clone(repo: Path, args) -> int:
-    """在干净克隆里跑完整探针：证明仓库不依赖任何未提交的本地残留。
-
-    这是「基础环境有没有问题」最硬的一条证据：把仓库 clone 到临时目录后，
-    依赖目录都不会跟过来（被 .gitignore 挡住了），必须现场装一遍才能起来。
-    """
-    report: dict[str, object] = {"repo": str(repo), "mode": "clean-clone", "steps": []}
+    """在干净克隆里跑完整探针，并在返回前移除克隆与依赖目录。"""
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+    report: dict[str, object] = {
+        "repo": str(repo), "mode": "clean-clone", "source_head": head.stdout.strip(), "steps": [],
+    }
     ok = True
 
     def record(name: str, passed: bool, detail: str, **extra: object) -> None:
@@ -221,59 +239,70 @@ def run_clean_clone(repo: Path, args) -> int:
         if not passed:
             ok = False
 
-    if not (repo / ".git").exists():
-        print(json.dumps({
-            **report,
-            "ok": False,
+    if not (repo / ".git").exists() or head.returncode != 0:
+        emit({
+            **report, "ok": False, "cleaned_up": True,
             "failed_steps": [{"step": "clean-clone", "ok": False,
-                              "detail": "仓库还不是 git 仓库，clean-clone 需要先 git init + 提交"}],
-        }, ensure_ascii=False, indent=2))
+                              "detail": "仓库需要已提交的 git HEAD 才能做 clean-clone"}],
+        }, args)
         return 2
 
     workspace = Path(tempfile.mkdtemp(prefix="repo-clean-clone-"))
     clone = workspace / repo.name
-    clone_proc = subprocess.run(["git", "clone", "--quiet", str(repo), str(clone)],
-                                capture_output=True, text=True)
-    record("克隆仓库到干净目录", clone_proc.returncode == 0,
-           (clone_proc.stderr or clone_proc.stdout or "ok").strip()[-300:], clone_dir=str(clone))
-    if clone_proc.returncode != 0:
-        print(json.dumps({**report, "ok": False,
-                          "failed_steps": report["steps"]}, ensure_ascii=False, indent=2))
-        return 1
-
-    status = subprocess.run(["git", "status", "--porcelain"], cwd=clone,
-                            capture_output=True, text=True)
-    record("克隆出来的工作区是干净的", status.stdout.strip() == "",
-           status.stdout.strip()[:200] or "工作区干净，没有未提交的必需文件")
-
-    carried = [str(path.relative_to(clone)) for name in ("node_modules", ".venv", "dist", "build")
-               for path in clone.rglob(name) if path.is_dir()]
-    record("依赖目录没有被提交进仓库", not carried,
-           "、".join(carried[:5]) or "node_modules / .venv / dist / build 都没进仓库",
-           carried=carried[:10])
-
-    command = [sys.executable, str(Path(__file__).resolve()), "--repo", str(clone),
-               "--timeout", str(args.timeout)]
-    if args.build:
-        command.append("--build")
-    probe = subprocess.run(command, capture_output=True, text=True)
     try:
-        payload = json.loads(probe.stdout[probe.stdout.index("{"):])
-    except (ValueError, json.JSONDecodeError):
-        payload = {"ok": False, "steps": [],
-                   "raw_tail": (probe.stdout or probe.stderr)[-400:]}
-    for step in payload.get("steps", []):
-        report["steps"].append({**step, "step": f"克隆内：{step['step']}"})
-    record("克隆里能装依赖、起服务、打开页面", bool(payload.get("ok")),
-           "全部通过" if payload.get("ok") else "见上面失败步骤")
-    report["clean_clone_probe"] = payload
-    report["clone_dir"] = str(clone)
-    # 克隆内那一轮的「进程是否停干净」要透出来，外层报告才完整
-    report["cleaned_up"] = payload.get("cleaned_up")
-    report["ok"] = ok
-    report["failed_steps"] = [step for step in report["steps"] if not step["ok"]]
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if ok else 1
+        clone_proc = run_command(["git", "clone", "--quiet", str(repo), str(clone)],
+                                 cwd=repo, timeout=args.timeout)
+        record("克隆仓库到干净目录", clone_proc.returncode == 0,
+               (clone_proc.stderr or clone_proc.stdout or "ok").strip()[-300:])
+        if clone_proc.returncode != 0:
+            report.update(ok=False, cleaned_up=True, failed_steps=report["steps"])
+            emit(report, args)
+            return 1
+
+        status = run_command(["git", "status", "--porcelain"], cwd=clone, timeout=args.timeout)
+        record("克隆出来的工作区是干净的", status.returncode == 0 and status.stdout.strip() == "",
+               status.stdout.strip()[:200] or "工作区干净，没有未提交的必需文件")
+        carried = [str(path.relative_to(clone)) for name in ("node_modules", ".venv", "dist", "build")
+                   for path in clone.rglob(name) if path.is_dir()]
+        record("依赖目录没有被提交进仓库", not carried,
+               "、".join(carried[:5]) or "node_modules / .venv / dist / build 都没进仓库",
+               carried=carried[:10])
+
+        command = [sys.executable, str(Path(__file__).resolve()), "--repo", str(clone),
+                   "--timeout", str(args.timeout)]
+        if args.build:
+            command.append("--build")
+        if args.skip_install:
+            command.append("--skip-install")
+        if args.skip_e2e:
+            command.append("--skip-e2e")
+        probe = run_command(command, cwd=repo, timeout=max(900.0, args.timeout * 5))
+        try:
+            payload = json.loads(probe.stdout[probe.stdout.index("{"):])
+        except (ValueError, json.JSONDecodeError):
+            payload = {"ok": False, "cleaned_up": False, "steps": [],
+                       "raw_tail": (probe.stdout or probe.stderr)[-400:]}
+        for step in payload.get("steps", []):
+            report["steps"].append({**step, "step": f"克隆内：{step['step']}"})
+        record("克隆里能装依赖、起服务并完成功能验收", bool(payload.get("ok")),
+               "全部通过" if payload.get("ok") else "见上面失败步骤")
+        record("克隆内进程全部停止", payload.get("cleaned_up") is True,
+               f"cleaned_up={payload.get('cleaned_up')}")
+        report["clean_clone_probe"] = payload
+        report["cleaned_up"] = payload.get("cleaned_up") is True
+
+        # 临时克隆会删除，把日志复制回源仓库外层的 .probe-logs 供排错。
+        source_logs = workspace / ".probe-logs" / repo.name
+        target_logs = repo.parent / ".probe-logs" / repo.name
+        if source_logs.is_dir():
+            shutil.copytree(source_logs, target_logs, dirs_exist_ok=True)
+            report["logs_dir"] = str(target_logs)
+        report["ok"] = ok
+        report["failed_steps"] = [step for step in report["steps"] if not step["ok"]]
+        emit(report, args)
+        return 0 if ok else 1
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def main() -> int:
@@ -287,6 +316,9 @@ def main() -> int:
                              "（证明不依赖任何未提交的本地残留）")
     parser.add_argument("--build", action="store_true",
                         help="探针跑完再在克隆里跑一次前端 npm run build")
+    parser.add_argument("--skip-e2e", action="store_true",
+                        help="仅调试启动时跳过浏览器全功能验收；发布流水线禁止使用该选项")
+    parser.add_argument("--json-out", help="同时把报告写到指定路径，供发布器核验")
     args = parser.parse_args()
 
     repo = Path(args.repo).expanduser().resolve()
@@ -337,12 +369,12 @@ def main() -> int:
             venv = backend_dir / ".venv"
             python_bin = venv / "bin" / "python"
             if not python_bin.exists() and not args.skip_install:
-                proc = subprocess.run([sys.executable, "-m", "venv", str(venv)],
-                                      capture_output=True, text=True)
+                proc = run_command([sys.executable, "-m", "venv", str(venv)],
+                                   cwd=backend_dir, timeout=args.timeout)
                 record("后端创建虚拟环境", proc.returncode == 0, proc.stderr[-400:] or "ok")
-                pip = subprocess.run(
+                pip = run_command(
                     [str(venv / "bin" / "pip"), "install", "-q", "-r", "requirements.txt"],
-                    cwd=backend_dir, capture_output=True, text=True)
+                    cwd=backend_dir, timeout=args.timeout * 2)
                 pip_tail = "\n".join((pip.stderr or pip.stdout).strip().splitlines()[-3:])
                 record("后端安装依赖", pip.returncode == 0,
                        pip_tail or "ok")
@@ -399,6 +431,19 @@ def main() -> int:
                 record("Java 后端 /api/health 就绪", ready, detail, port=port)
                 if ready:
                     live_backend_port = port
+                    status, body = http_get(f"{base}/api/overview")
+                    record("Java 后端 /api/overview 有数据", status == 200 and "modules" in body,
+                           f"status={status} body={body[:200]}")
+                    endpoints = discover_business_endpoints(backend_dir)
+                    probed = ("", 0, "")
+                    for endpoint in endpoints:
+                        status, body = http_get(f"{base}{endpoint}")
+                        probed = (endpoint, status, body)
+                        if status == 200 and "items" in body:
+                            break
+                    endpoint, status, body = probed
+                    record("Java 后端业务接口可访问", status == 200 and "items" in body,
+                           f"{endpoint} status={status} body={body[:200]}")
         else:
             record("后端启动", False, f"识别不出后端类型：{backend}")
 
@@ -411,8 +456,9 @@ def main() -> int:
                 if npm is None:
                     record("前端安装依赖", False, "本机没有 npm")
                 else:
-                    proc = subprocess.run([npm, "install", "--no-audit", "--no-fund"],
-                                          cwd=frontend_dir, capture_output=True, text=True)
+                    install_command = "ci" if (frontend_dir / "package-lock.json").is_file() else "install"
+                    proc = run_command([npm, install_command, "--no-audit", "--no-fund"],
+                                       cwd=frontend_dir, timeout=args.timeout * 2)
                     record("前端安装依赖", proc.returncode == 0,
                            (proc.stderr or proc.stdout)[-600:] or "ok")
             port = free_port(frontend_port)
@@ -450,23 +496,48 @@ def main() -> int:
                 else:
                     record("前端 -> 后端代理链路通", False, "后端没起来，代理无从验证")
 
+        # ---------- 浏览器全功能验收（默认必须）----------
+        if not args.skip_e2e:
+            test_file = frontend_dir / "tests" / "functionality.spec.ts" if frontend_dir else None
+            npx = shutil.which("npx")
+            if not live_frontend_port or not frontend_dir or not test_file or not test_file.is_file() or not npx:
+                record("浏览器全功能验收", False,
+                       "前端未就绪、缺少 tests/functionality.spec.ts 或本机没有 npx")
+            else:
+                installed = run_command([npx, "playwright", "install", "chromium"],
+                                        cwd=frontend_dir, timeout=max(300.0, args.timeout * 2))
+                record("浏览器运行时就绪", installed.returncode == 0,
+                       (installed.stderr or installed.stdout)[-600:] or "ok")
+                if installed.returncode == 0:
+                    e2e_env = {**os.environ, "CI": "1", "E2E_BASE_URL": f"http://127.0.0.1:{live_frontend_port}"}
+                    e2e = run_command([npm, "run", "test:e2e"], cwd=frontend_dir,
+                                      timeout=max(360.0, args.timeout * 2), env=e2e_env)
+                    record("浏览器全功能验收", e2e.returncode == 0,
+                           (e2e.stderr or e2e.stdout)[-1200:] or "ok")
+
         # ---------- 生产构建（可选）----------
         if args.build and frontend_dir is not None:
             npm_bin = shutil.which("npm") or "npm"
-            build_proc = subprocess.run([npm_bin, "run", "build"], cwd=frontend_dir,
-                                        capture_output=True, text=True)
+            build_proc = run_command([npm_bin, "run", "build"], cwd=frontend_dir, timeout=args.timeout * 2)
             build_tail = "\n".join((build_proc.stderr or build_proc.stdout).strip().splitlines()[-3:])
             record("前端生产构建通过（typecheck + vite build）", build_proc.returncode == 0,
                    build_tail or "ok")
     finally:
         result["live_ports"] = {"backend": live_backend_port, "frontend": live_frontend_port}
+        cleanup_errors = []
         for process, log_path in processes:
-            terminate(process, log_path)
-        result["cleaned_up"] = all(process.poll() is not None for process, _ in processes)
+            try:
+                terminate(process, log_path)
+            except Exception as error:  # noqa: BLE001 - 清理失败也必须进入报告
+                cleanup_errors.append(f"PID {process.pid}: {error}")
+        result["cleaned_up"] = not cleanup_errors and all(process.poll() is not None for process, _ in processes)
+        result["cleanup_errors"] = cleanup_errors
 
-    result["ok"] = ok
+    result["ok"] = ok and result["cleaned_up"] is True
     result["failed_steps"] = [step for step in steps if not step["ok"]]
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result["cleaned_up"] is not True:
+        result["failed_steps"].append({"step": "进程清理", "ok": False, "detail": "仍有进程未停止"})
+    emit(result, args)
     return 0 if ok else 1
 
 

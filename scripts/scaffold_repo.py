@@ -28,12 +28,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import keyword
 import pprint
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -61,7 +64,12 @@ MAX_NUMBER_PROBES = 200
 RESERVED_MODULE_KEYS = frozenset({
     "node_modules", "dist", "build", "out", "target", "coverage", "logs",
     "classes", "eggs", "env", "venv", "__pycache__",
+    # 系统级 API 已占用 /api/health 与 /api/overview，业务模块不能覆盖它们。
+    "health", "overview",
 })
+
+APP_SLUG_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+MODULE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def validate_prefix(prefix: str) -> str:
@@ -178,12 +186,17 @@ def spec_topic_corpus(spec: dict) -> dict[str, str]:
     corpus: dict[str, str] = {}
     for field in SPEC_TOPIC_SCALARS:
         corpus[field] = str(spec.get(field) or "")
-    for index, module in enumerate(spec.get("modules") or [], start=1):
+    modules = spec.get("modules") if isinstance(spec.get("modules"), list) else []
+    for index, module in enumerate(modules, start=1):
+        if not isinstance(module, dict):
+            corpus[f"modules[{index}]"] = str(module)
+            continue
         key = str(module.get("key") or f"module{index}")
         for field in SPEC_TOPIC_MODULE_SCALARS:
             corpus[f"modules[{key}].{field}"] = str(module.get(field) or "")
         for field in SPEC_TOPIC_LIST_FIELDS:
-            for item in module.get(field) or []:
+            values = module.get(field) if isinstance(module.get(field), list) else []
+            for item in values:
                 corpus[f"modules[{key}].{field}[]"] = (
                     corpus.get(f"modules[{key}].{field}[]", "") + "\n" + str(item))
     return corpus
@@ -226,10 +239,27 @@ def banned_topic_report(hits: list[dict[str, str]], spec_path: object = None) ->
     return "\n".join(lines)
 
 
-def load_spec(path: Path | None, frontend: str | None, backend: str | None) -> dict:
-    if path is None:
-        path = SKILL_DIR / "examples" / DEFAULT_SPEC_NAME
-    spec = json.loads(Path(path).read_text(encoding="utf-8"))
+def _string_list(value: object, *, label: str, minimum: int = 1,
+                 allow_duplicates: bool = False) -> list[str]:
+    if not isinstance(value, list) or len(value) < minimum:
+        raise SystemExit(f"{label} 必须是至少含 {minimum} 项的字符串数组")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise SystemExit(f"{label} 只能包含非空字符串")
+    result = [item.strip() for item in value]
+    if not allow_duplicates and len(set(result)) != len(result):
+        raise SystemExit(f"{label} 不能有重复项")
+    return result
+
+
+def normalize_spec(raw_spec: dict, frontend: str | None = None, backend: str | None = None) -> dict:
+    """在落盘前完成全部结构校验和默认值归一化。
+
+    这个函数同时服务 --check-spec、直接 scaffold 调用和流水线预检，避免文档说可选、
+    生成器却在写到一半时才 KeyError 的分叉行为。
+    """
+    if not isinstance(raw_spec, dict):
+        raise SystemExit("spec 顶层必须是 JSON 对象")
+    spec = copy.deepcopy(raw_spec)
     domain_rules.validate(spec)
     if frontend:
         spec["frontend"] = frontend
@@ -237,34 +267,92 @@ def load_spec(path: Path | None, frontend: str | None, backend: str | None) -> d
         spec["backend"] = backend
     spec.setdefault("frontend", "vue")
     spec.setdefault("backend", "python")
+    spec.setdefault("port_frontend", 5173)
+    spec.setdefault("port_backend", 8000)
+    for field in ("app_name", "app_slug", "app_desc"):
+        if not isinstance(spec.get(field), str) or not spec[field].strip():
+            raise SystemExit(f"spec.{field} 必须是非空字符串")
+        spec[field] = spec[field].strip()
+    if not APP_SLUG_RE.fullmatch(spec["app_slug"]):
+        raise SystemExit("spec.app_slug 只能用小写字母、数字和单个连字符，且必须以字母开头")
     if spec["frontend"] not in {"vue", "react"}:
         raise SystemExit(f"前端只支持 vue / react，收到 {spec['frontend']!r}")
     if spec["backend"] not in {"python", "java", "none"}:
         raise SystemExit(
             f"后端只支持 python / java / none（none = 纯前端仓库），收到 {spec['backend']!r}")
-    modules = spec.get("modules") or []
-    if not modules:
-        raise SystemExit("spec 里没有任何 modules")
+    for field in ("port_frontend", "port_backend"):
+        value = spec[field]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1024 <= value <= 65535:
+            raise SystemExit(f"spec.{field} 必须是 1024~65535 的整数端口")
+    if spec["port_frontend"] == spec["port_backend"] and spec["backend"] != "none":
+        raise SystemExit("全栈仓库的前后端端口不能相同")
+
+    modules = spec.get("modules")
+    if not isinstance(modules, list) or len(modules) < 16:
+        raise SystemExit("spec.modules 必须至少包含 16 个模块，才能满足容量下限")
     seen: set[str] = set()
-    for module in modules:
-        for field in ("key", "name", "entity", "fields"):
-            if not module.get(field):
-                raise SystemExit(f"模块缺少字段 {field}：{module}")
-        if module["key"] in seen:
-            raise SystemExit(f"模块 key 重复：{module['key']}")
-        if module["key"] in RESERVED_MODULE_KEYS:
+    seen_classes: set[str] = set()
+    normalized_modules = []
+    for index, module in enumerate(modules):
+        if not isinstance(module, dict):
+            raise SystemExit(f"modules[{index}] 必须是 JSON 对象")
+        module = copy.deepcopy(module)
+        for field in ("key", "name", "entity"):
+            if not isinstance(module.get(field), str) or not module[field].strip():
+                raise SystemExit(f"modules[{index}] 缺少非空字符串字段 {field}")
+            module[field] = module[field].strip()
+        key = module["key"]
+        if key in RESERVED_MODULE_KEYS:
+            raise SystemExit(f"模块 key 不能叫 {key!r}：会撞依赖目录或系统级 /api/{key} 端点")
+        if not MODULE_KEY_RE.fullmatch(key) or keyword.iskeyword(key):
             raise SystemExit(
-                f"模块 key 不能叫 {module['key']!r}：它会变成 frontend/src/views/"
-                f"{module['key']}/，而这个名字在生成的 .gitignore 里是依赖 / 构建产物规则，"
-                "整个模块的页面会被 git 忽略、干净克隆里少文件、前端构建直接报错。"
-                "换一个业务化的 key（例如 target 改成 threat）。")
-        seen.add(module["key"])
-        if len(module["fields"]) < 3:
-            raise SystemExit(f"模块 {module['key']} 的 fields 少于 3 个，主体识别会不达标")
-    topic_hits = scan_spec_topics(spec)
+                f"模块 key {key!r} 不合法：只支持小写字母/数字/下划线、以字母开头，且不能是 Python 关键字")
+        if key in seen:
+            raise SystemExit(f"模块 key 重复：{key}")
+        generated_class = class_name(key)
+        if generated_class in seen_classes:
+            raise SystemExit(f"模块 key {key!r} 与其他模块生成相同的类名 {generated_class}，请调整命名")
+        seen.add(key)
+        seen_classes.add(generated_class)
+        module["fields"] = _string_list(module.get("fields"), label=f"模块 {key}.fields", minimum=3)
+        module["statuses"] = _string_list(module.get("statuses"), label=f"模块 {key}.statuses", minimum=2)
+        module["actions"] = _string_list(module.get("actions"), label=f"模块 {key}.actions", minimum=1)
+        targets = module.get("action_targets")
+        if targets is None:
+            targets = [module["statuses"][min(i + 1, len(module["statuses"]) - 1)]
+                       for i in range(len(module["actions"]))]
+        module["action_targets"] = _string_list(
+            targets, label=f"模块 {key}.action_targets", minimum=len(module["actions"]),
+            allow_duplicates=True)
+        if len(module["action_targets"]) != len(module["actions"]):
+            raise SystemExit(f"模块 {key} 的 actions 与 action_targets 数量必须一致")
+        missing_targets = sorted(set(module["action_targets"]) - set(module["statuses"]))
+        if missing_targets:
+            raise SystemExit(f"模块 {key} 的 action_targets 引用了未定义状态：{'、'.join(missing_targets)}")
+        if module.get("metrics") is not None:
+            module["metrics"] = _string_list(module["metrics"], label=f"模块 {key}.metrics", minimum=3)
+            if len(module["metrics"]) != 3:
+                raise SystemExit(f"模块 {key}.metrics 必须正好有 3 项，对应页面三张指标卡")
+        if module.get("desc") is not None and not isinstance(module["desc"], str):
+            raise SystemExit(f"模块 {key}.desc 必须是字符串")
+        normalized_modules.append(module)
+    spec["modules"] = normalized_modules
+    return spec
+
+
+def load_spec(path: Path | None, frontend: str | None, backend: str | None) -> dict:
+    if path is None:
+        path = SKILL_DIR / "examples" / DEFAULT_SPEC_NAME
+    path = Path(path)
+    try:
+        raw_spec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"spec 无法读取或不是合法 JSON：{path}（{exc}）") from None
+    # 题域命中优先报告，避免被无关格式错误遮住真正的判废原因。
+    topic_hits = scan_spec_topics(raw_spec) if isinstance(raw_spec, dict) else []
     if topic_hits:
         raise SystemExit(banned_topic_report(topic_hits, spec_path=path))
-    return spec
+    return normalize_spec(raw_spec, frontend, backend)
 
 
 def render(template: str, **values: object) -> str:
@@ -379,6 +467,8 @@ pnpm-debug.log*
 
 # ===== 测试覆盖率 =====
 coverage/
+test-results/
+playwright-report/
 .nyc_output/
 htmlcov/
 *.lcov
@@ -445,7 +535,7 @@ __BACKEND_RUN__
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
@@ -476,6 +566,9 @@ services:
     build: ./frontend
     ports:
       - "__FRONTEND_PORT__:__FRONTEND_PORT__"
+    environment:
+      # 前端容器里的 127.0.0.1 是它自己，必须走 Compose 服务名访问后端。
+      VITE_PROXY_TARGET: http://backend:__BACKEND_PORT__
     depends_on:
       - backend
 """
@@ -485,7 +578,7 @@ MAKEFILE = """\
 
 install:
 \tcd backend && __BACKEND_INSTALL__
-\tcd frontend && npm install
+\tcd frontend && npm ci
 
 backend:
 \tcd backend && __BACKEND_RUN__
@@ -581,7 +674,8 @@ PACKAGE_JSON_VUE = """\
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "pinia": "^2.1.7",
@@ -590,6 +684,7 @@ PACKAGE_JSON_VUE = """\
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
+    "@playwright/test": "^1.56.1",
     "@vitejs/plugin-vue": "^5.0.4",
     "typescript": "^5.4.3",
     "vite": "^5.2.6",
@@ -609,7 +704,8 @@ PACKAGE_JSON_REACT = """\
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -618,6 +714,7 @@ PACKAGE_JSON_REACT = """\
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
+    "@playwright/test": "^1.56.1",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
@@ -625,6 +722,157 @@ PACKAGE_JSON_REACT = """\
     "vite": "^5.2.6"
   }
 }
+"""
+
+PLAYWRIGHT_CONFIG_TS = """\
+import { defineConfig } from '@playwright/test'
+
+export default defineConfig({
+  testDir: './tests',
+  timeout: 300_000,
+  expect: { timeout: 10_000 },
+  workers: 1,
+  use: {
+    baseURL: process.env.E2E_BASE_URL || 'http://127.0.0.1:5173',
+    browserName: 'chromium',
+    headless: true,
+    actionTimeout: 10_000,
+  },
+  reporter: 'line',
+})
+"""
+
+FUNCTIONALITY_TEST_TS = """\
+import { expect, test } from '@playwright/test'
+import { readFile } from 'node:fs/promises'
+
+type ModuleCase = {
+  key: string
+  fields: string[]
+  actions: string[]
+  actionTargets: string[]
+}
+
+const modules: ModuleCase[] = __MODULES__
+const repoKind = '__REPO_KIND__'
+
+function parseCsv(text: string): string[][] {
+  const records: string[][] = []
+  let row: string[] = []
+  let cell = ''
+  let quoted = false
+  const input = text.replace(/^\\uFEFF/, '')
+  for (let index = 0; index < input.length; index++) {
+    const char = input[index]
+    if (quoted) {
+      if (char === '"' && input[index + 1] === '"') {
+        cell += '"'
+        index++
+      } else if (char === '"') {
+        quoted = false
+      } else {
+        cell += char
+      }
+    } else if (char === '"' && cell === '') {
+      quoted = true
+    } else if (char === ',') {
+      row.push(cell)
+      cell = ''
+    } else if (char === '\\n') {
+      row.push(cell.replace(/\\r$/, ''))
+      if (row.some((value) => value !== '')) records.push(row)
+      row = []
+      cell = ''
+    } else {
+      cell += char
+    }
+  }
+  row.push(cell.replace(/\\r$/, ''))
+  if (row.some((value) => value !== '')) records.push(row)
+  return records
+}
+
+test('所有模块的查询、登记、动作、导出和指标均可用', async ({ page }) => {
+  test.setTimeout(300_000)
+  const browserErrors: string[] = []
+  page.on('pageerror', (error) => browserErrors.push(error.message))
+  page.on('response', (response) => {
+    if (response.url().includes('/api/') && response.status() >= 400) {
+      browserErrors.push(`${response.status()} ${response.url()}`)
+    }
+  })
+
+  for (const module of modules) {
+    await page.goto(`/${module.key}`)
+    const bodyRows = page.locator('tbody tr[data-testid^="row-"]')
+    await expect(bodyRows).toHaveCount(3)
+    const firstValue = await bodyRows.nth(0).locator('td').nth(0).innerText()
+    const secondValue = await bodyRows.nth(1).locator('td').nth(0).innerText()
+
+    // 正向查询必须只保留命中行，导出也必须遵循同一筛选条件。
+    await page.getByTestId(`filter-${module.fields[0]}`).fill(firstValue)
+    await page.getByTestId('query').click()
+    await expect(bodyRows).toHaveCount(1)
+    await expect(bodyRows.first()).toContainText(firstValue)
+    const downloadPromise = page.waitForEvent('download')
+    await page.getByTestId('export').click()
+    const download = await downloadPromise
+    expect(download.suggestedFilename()).toBe(`${module.key}.csv`)
+    const downloadPath = await download.path()
+    expect(downloadPath).not.toBeNull()
+    const csv = parseCsv(await readFile(downloadPath as string, 'utf-8'))
+    expect(csv[0]).toEqual(['id', ...module.fields, 'status'])
+    expect(csv).toHaveLength(2)
+    expect(csv[1][1]).toBe(firstValue)
+    expect(csv[1][1]).not.toBe(secondValue)
+
+    // 无结果和重置也必须真实改变页面，而非仅发起一个被后端忽略的请求。
+    await page.getByTestId(`filter-${module.fields[0]}`).fill('__必定无结果__')
+    await page.getByTestId('query').click()
+    await expect(bodyRows).toHaveCount(0)
+    await expect(page.locator('tbody')).toContainText('暂无')
+    await page.getByTestId('reset').click()
+    await expect(bodyRows).toHaveCount(3)
+
+    if (repoKind === 'fullstack') {
+      const invalidCreate = await page.request.post(`/api/${module.key}`, { data: {} })
+      expect(invalidCreate.ok()).toBe(true)
+      expect((await invalidCreate.json()).ok).toBe(false)
+    }
+
+    const createdValues = module.fields.map((field, index) => `验收-${module.key}-${index + 1}`)
+    await page.getByTestId('open-create').click()
+    await expect(page.getByTestId('create-modal')).toBeVisible()
+    for (const [index, field] of module.fields.entries()) {
+      await page.getByTestId(`create-${field}`).fill(createdValues[index])
+    }
+    await page.getByTestId('submit-create').click()
+    await expect(page.getByTestId('create-modal')).toHaveCount(0)
+    await expect(bodyRows).toHaveCount(4)
+    const createdRow = page.locator('tbody tr').filter({ hasText: createdValues[0] })
+    await expect(createdRow).toHaveCount(1)
+    await expect(page.locator('.stat-value').first()).toHaveText('4')
+
+    if (repoKind === 'frontend-only') {
+      await page.reload()
+      await expect(page.locator('tbody tr').filter({ hasText: createdValues[0] })).toHaveCount(1)
+    }
+
+    for (const [index, action] of module.actions.entries()) {
+      await createdRow.getByRole('button', { name: action, exact: true }).click()
+      await expect(createdRow).toHaveAttribute('data-status', module.actionTargets[index])
+    }
+  }
+
+  // 所有模块各新增一条后，概览必须汇总到 72；本地形态另点一次重新统计。
+  await page.goto('/')
+  await expect(page.locator('.stat-value').nth(1)).toHaveText(String(modules.length * 4))
+  if (repoKind === 'frontend-only') {
+    await page.getByRole('button', { name: '重新统计', exact: true }).click()
+    await expect(page.locator('.stat-value').nth(1)).toHaveText(String(modules.length * 4))
+  }
+  expect(browserErrors).toEqual([])
+})
 """
 
 INDEX_HTML = """\
@@ -893,6 +1141,11 @@ body { margin: 0; background: #f6f8fb; color: #1f2937; }
 .link { border: none; background: none; color: var(--brand); cursor: pointer; padding: 0; }
 .page-foot { display: flex; justify-content: space-between; margin-top: 8px; font-size: 12px; color: var(--muted); }
 .error-text { color: #b42318; }
+.modal-backdrop { position: fixed; inset: 0; background: rgb(15 23 42 / 35%); display: grid; place-items: center; padding: 20px; z-index: 20; }
+.modal { width: min(560px, 100%); max-height: 90vh; overflow: auto; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 20px 50px rgb(15 23 42 / 20%); }
+.create-field { display: block; margin-bottom: 10px; }
+.create-field span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.create-field input { width: 100%; box-sizing: border-box; border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
 """
 
 VUE_VIEW = """\
@@ -904,8 +1157,8 @@ VUE_VIEW = """\
         <p class="page-desc">__DESC__</p>
       </div>
       <div class="page-actions">
-        <button class="btn primary" type="button" @click="openCreate">登记__ENTITY__</button>
-        <button class="btn" type="button" @click="exportRows">导出__NAME__清单</button>
+        <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">登记__ENTITY__</button>
+        <button class="btn" data-testid="export" type="button" @click="exportRows">导出__NAME__清单</button>
       </div>
     </header>
 
@@ -919,10 +1172,10 @@ VUE_VIEW = """\
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+        <input v-model="filters[field]" :data-testid="`filter-${field}`" :placeholder="`按${field}检索`" />
       </label>
-      <button class="btn" type="submit">查询</button>
-      <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
+      <button class="btn" data-testid="query" type="submit">查询</button>
+      <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
 
     <table class="data-table">
@@ -933,7 +1186,7 @@ VUE_VIEW = """\
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)">
+        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
           <td class="row-actions">
             <button
@@ -941,6 +1194,7 @@ VUE_VIEW = """\
               :key="action"
               class="link"
               type="button"
+              :data-testid="`action-${row.id}-${action}`"
               @click="runAction(action, row)"
             >
               {{ action }}
@@ -953,6 +1207,22 @@ VUE_VIEW = """\
       </tbody>
     </table>
 
+    <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
+      <form class="modal" @submit.prevent="submitCreate">
+        <h3>登记__ENTITY__</h3>
+        <label v-for="field in columns" :key="field" class="create-field">
+          <span>{{ field }}</span>
+          <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
+        </label>
+        <div class="page-actions">
+          <button class="btn" type="button" @click="showCreate = false">取消</button>
+          <button class="btn primary" data-testid="submit-create" type="submit" :disabled="creating">
+            {{ creating ? '提交中…' : '确认登记' }}
+          </button>
+        </div>
+      </form>
+    </div>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条__NAME__记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -961,7 +1231,7 @@ VUE_VIEW = """\
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { request } from '@/api/client'
 
@@ -971,25 +1241,66 @@ const ENDPOINT = '/api/__KEY__'
 const columns = __FIELDS__
 const actions = __ACTIONS__
 const statuses = __STATUSES__
-const stats = __METRICS__
+const metricNames = __METRICS_NAMES__
 
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+const showCreate = ref(false)
+const creating = ref(false)
+const createValues = ref<Record<string, string>>({})
+const stats = computed(() => [
+  { label: metricNames[0], value: total.value },
+  { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
+  { label: metricNames[2], value: rows.value.filter((row) => row.status === statuses[statuses.length - 1]).length },
+])
 
 function resetFilters() {
   filters.value = {}
   void reload()
 }
 
-function exportRows() {
-  window.open(`${ENDPOINT}/export`, '_blank')
+async function exportRows() {
+  errorMessage.value = ''
+  const query = new URLSearchParams(filters.value).toString()
+  try {
+    const response = await request(`${ENDPOINT}/export?${query}`)
+    if (!response.ok) throw new Error('导出失败，请稍后重试')
+    const url = URL.createObjectURL(await response.blob())
+    const link = document.createElement('a')
+    link.href = url
+    link.download = '__KEY__.csv'
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '导出失败'
+  }
 }
 
 function openCreate() {
-  errorMessage.value = '__ENTITY__登记入口尚未接入审批流'
+  createValues.value = Object.fromEntries(columns.map((field) => [field, '']))
+  errorMessage.value = ''
+  showCreate.value = true
+}
+
+async function submitCreate() {
+  creating.value = true
+  errorMessage.value = ''
+  try {
+    const response = await request(ENDPOINT, {
+      method: 'POST', body: JSON.stringify(createValues.value),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) throw new Error(payload.message || '登记失败')
+    showCreate.value = false
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '登记失败'
+  } finally {
+    creating.value = false
+  }
 }
 
 async function runAction(action: string, row: Row) {
@@ -1037,7 +1348,7 @@ const ENDPOINT = '/api/__KEY__'
 const columns = __FIELDS__
 const actions = __ACTIONS__
 const statuses = __STATUSES__
-const stats = __METRICS__
+const metricNames = __METRICS_NAMES__
 
 type Row = Record<string, string | number | null>
 
@@ -1047,6 +1358,14 @@ export default function __CLASS__View() {
   const [errorMessage, setErrorMessage] = useState('')
   const [filters, setFilters] = useState<Record<string, string>>({})
   const filterFields = useMemo(() => columns.slice(0, 3), [])
+  const [showCreate, setShowCreate] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [createValues, setCreateValues] = useState<Record<string, string>>({})
+  const stats = useMemo(() => [
+    { label: metricNames[0], value: total },
+    { label: metricNames[1], value: rows.filter((row) => row.status === statuses[1]).length },
+    { label: metricNames[2], value: rows.filter((row) => row.status === statuses[statuses.length - 1]).length },
+  ], [rows, total])
 
   const reload = useCallback(async () => {
     setErrorMessage('')
@@ -1068,6 +1387,48 @@ export default function __CLASS__View() {
     void reload()
   }, [reload])
 
+  function openCreate() {
+    setCreateValues(Object.fromEntries(columns.map((field) => [field, ''])))
+    setErrorMessage('')
+    setShowCreate(true)
+  }
+
+  async function exportRows() {
+    setErrorMessage('')
+    const query = new URLSearchParams(filters).toString()
+    try {
+      const response = await request(`${ENDPOINT}/export?${query}`)
+      if (!response.ok) throw new Error('导出失败，请稍后重试')
+      const url = URL.createObjectURL(await response.blob())
+      const link = document.createElement('a')
+      link.href = url
+      link.download = '__KEY__.csv'
+      link.click()
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '导出失败')
+    }
+  }
+
+  async function submitCreate(event: React.FormEvent) {
+    event.preventDefault()
+    setCreating(true)
+    setErrorMessage('')
+    try {
+      const response = await request(ENDPOINT, {
+        method: 'POST', body: JSON.stringify(createValues),
+      })
+      const payload = await response.json()
+      if (!response.ok || !payload.ok) throw new Error(payload.message || '登记失败')
+      setShowCreate(false)
+      await reload()
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '登记失败')
+    } finally {
+      setCreating(false)
+    }
+  }
+
   async function runAction(action: string, row: Row) {
     setErrorMessage('')
     try {
@@ -1075,8 +1436,9 @@ export default function __CLASS__View() {
         method: 'POST',
         body: JSON.stringify({ action }),
       })
-      if (!response.ok) {
-        throw new Error('__NAME__动作未生效，请稍后重试')
+      const payload = await response.json()
+      if (!response.ok || !payload.ok) {
+        throw new Error(payload.message || '__NAME__动作未生效，请稍后重试')
       }
       await reload()
     } catch (error) {
@@ -1092,10 +1454,10 @@ export default function __CLASS__View() {
           <p className="page-desc">__DESC__</p>
         </div>
         <div className="page-actions">
-          <button className="btn primary" type="button" onClick={() => setErrorMessage('__ENTITY__登记入口尚未接入审批流')}>
+          <button className="btn primary" data-testid="open-create" type="button" onClick={openCreate}>
             登记__ENTITY__
           </button>
-          <button className="btn" type="button" onClick={() => window.open(`${ENDPOINT}/export`, '_blank')}>
+          <button className="btn" data-testid="export" type="button" onClick={() => void exportRows()}>
             导出__NAME__清单
           </button>
         </div>
@@ -1116,13 +1478,14 @@ export default function __CLASS__View() {
             <span>{field}</span>
             <input
               value={filters[field] ?? ''}
+              data-testid={`filter-${field}`}
               placeholder={`按${field}检索`}
               onChange={(event) => setFilters((prev) => ({ ...prev, [field]: event.target.value }))}
             />
           </label>
         ))}
-        <button className="btn" type="submit">查询</button>
-        <button className="btn ghost" type="button" onClick={() => setFilters({})}>重置条件</button>
+        <button className="btn" data-testid="query" type="submit">查询</button>
+        <button className="btn ghost" data-testid="reset" type="button" onClick={() => setFilters({})}>重置条件</button>
       </form>
 
       <table className="data-table">
@@ -1134,11 +1497,11 @@ export default function __CLASS__View() {
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={String(row.id)}>
+            <tr key={String(row.id)} data-testid={`row-${row.id}`} data-status={String(row.status)}>
               {columns.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
               <td className="row-actions">
                 {actions.map((action) => (
-                  <button key={action} className="link" type="button" onClick={() => void runAction(action, row)}>
+                  <button key={action} data-testid={`action-${row.id}-${action}`} className="link" type="button" onClick={() => void runAction(action, row)}>
                     {action}
                   </button>
                 ))}
@@ -1152,6 +1515,31 @@ export default function __CLASS__View() {
           )}
         </tbody>
       </table>
+
+      {showCreate && (
+        <div className="modal-backdrop" data-testid="create-modal">
+          <form className="modal" onSubmit={submitCreate}>
+            <h3>登记__ENTITY__</h3>
+            {columns.map((field) => (
+              <label key={field} className="create-field">
+                <span>{field}</span>
+                <input
+                  value={createValues[field] ?? ''}
+                  data-testid={`create-${field}`}
+                  required
+                  onChange={(event) => setCreateValues((prev) => ({ ...prev, [field]: event.target.value }))}
+                />
+              </label>
+            ))}
+            <div className="page-actions">
+              <button className="btn" type="button" onClick={() => setShowCreate(false)}>取消</button>
+              <button className="btn primary" data-testid="submit-create" type="submit" disabled={creating}>
+                {creating ? '提交中…' : '确认登记'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       <footer className="page-foot">
         <span>共 {total} 条__NAME__记录</span>
@@ -1194,7 +1582,7 @@ DASHBOARD_VUE = """\
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { fetchJson } from '@/api/client'
 
@@ -1500,6 +1888,25 @@ export function listEntries(key: string, filters: Record<string, string> = {}): 
   return { items: matched, total: matched.length, page: 1, size: matched.length }
 }
 
+export function createEntry(key: string, values: Record<string, string>): ActionResult {
+  const meta = moduleMeta(key)
+  const missing = meta.fields.slice(0, 3).filter((field) => !values[field]?.trim())
+  if (missing.length) {
+    return { ok: false, message: `缺少必填字段：${missing.join('、')}` }
+  }
+  const rows = listRows(key)
+  const id = Math.max(0, ...rows.map((row) => Number(row.id) || 0)) + 1
+  const entry: EntryRow = {
+    id,
+    ...Object.fromEntries(meta.fields.map((field) => [field, values[field]?.trim() ?? ''])),
+    status: meta.statuses[0],
+    pending: true,
+    abnormal: false,
+  }
+  saveRows(key, [...rows, entry])
+  return { ok: true, message: `${meta.entity}已登记` }
+}
+
 export function runAction(key: string, id: number, action: string): ActionResult {
   const meta = moduleMeta(key)
   const target = meta.actionTargets[action]
@@ -1510,10 +1917,6 @@ export function runAction(key: string, id: number, action: string): ActionResult
   const index = rows.findIndex((row) => Number(row.id) === id)
   if (index < 0) {
     return { ok: false, message: `没有找到编号为 ${id} 的${meta.entity}` }
-  }
-  const current = String(rows[index].status)
-  if (current === target) {
-    return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
   const lastStatus = meta.statuses[meta.statuses.length - 1]
   const updated: EntryRow = {
@@ -1533,18 +1936,27 @@ export function resetModule(key: string): PageResult {
   return listEntries(key)
 }
 
-export function exportEntries(key: string): { filename: string; content: string } {
-  const meta = moduleMeta(key)
-  const header = ['编号', ...meta.fields, '当前状态']
-  const lines = [header.join(',')]
-  for (const row of listRows(key)) {
-    lines.push([row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status].join(','))
-  }
-  return { filename: `${meta.name}-清单.csv`, content: `\\uFEFF${lines.join('\\n')}` }
+function csvCell(value: unknown): string {
+  let text = value === null || value === undefined ? '' : String(value)
+  if (/^[=+@-]/.test(text)) text = `'${text}`
+  return `"${text.replace(/"/g, '""')}"`
 }
 
-export function downloadEntries(key: string): void {
-  const { filename, content } = exportEntries(key)
+export function exportEntries(
+  key: string,
+  filters: Record<string, string> = {},
+): { filename: string; content: string } {
+  const meta = moduleMeta(key)
+  const header = ['id', ...meta.fields, 'status']
+  const lines = [header.map(csvCell).join(',')]
+  for (const row of filterRows(listRows(key), filters)) {
+    lines.push([row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status].map(csvCell).join(','))
+  }
+  return { filename: `${meta.key}.csv`, content: `\\uFEFF${lines.join('\\n')}` }
+}
+
+export function downloadEntries(key: string, filters: Record<string, string> = {}): void {
+  const { filename, content } = exportEntries(key, filters)
   const blob = new Blob([content], { type: 'text/csv;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
@@ -1586,8 +1998,8 @@ VUE_VIEW_LOCAL = """\
         <p class="page-desc">__DESC__</p>
       </div>
       <div class="page-actions">
-        <button class="btn primary" type="button" @click="openCreate">登记__ENTITY__</button>
-        <button class="btn" type="button" @click="exportRows">导出__NAME__清单</button>
+        <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">登记__ENTITY__</button>
+        <button class="btn" data-testid="export" type="button" @click="exportRows">导出__NAME__清单</button>
       </div>
     </header>
 
@@ -1607,10 +2019,10 @@ VUE_VIEW_LOCAL = """\
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
-        <input v-model="filters[field]" :placeholder="`按${field}检索`" />
+        <input v-model="filters[field]" :data-testid="`filter-${field}`" :placeholder="`按${field}检索`" />
       </label>
-      <button class="btn" type="submit">查询</button>
-      <button class="btn ghost" type="button" @click="resetFilters">重置条件</button>
+      <button class="btn" data-testid="query" type="submit">查询</button>
+      <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
 
     <table class="data-table">
@@ -1622,7 +2034,7 @@ VUE_VIEW_LOCAL = """\
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)">
+        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
@@ -1631,6 +2043,7 @@ VUE_VIEW_LOCAL = """\
               :key="action"
               class="link"
               type="button"
+              :data-testid="`action-${row.id}-${action}`"
               @click="runAction(action, row)"
             >
               {{ action }}
@@ -1642,6 +2055,22 @@ VUE_VIEW_LOCAL = """\
         </tr>
       </tbody>
     </table>
+
+    <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
+      <form class="modal" @submit.prevent="submitCreate">
+        <h3>登记__ENTITY__</h3>
+        <label v-for="field in columns" :key="field" class="create-field">
+          <span>{{ field }}</span>
+          <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
+        </label>
+        <div class="page-actions">
+          <button class="btn" type="button" @click="showCreate = false">取消</button>
+          <button class="btn primary" data-testid="submit-create" type="submit" :disabled="creating">
+            {{ creating ? '提交中…' : '确认登记' }}
+          </button>
+        </div>
+      </form>
+    </div>
 
     <footer class="page-foot">
       <span>共 {{ total }} 条__NAME__记录</span>
@@ -1655,6 +2084,7 @@ import { computed, onMounted, ref } from 'vue'
 
 import {
   downloadEntries,
+  createEntry,
   listEntries,
   moduleMeta,
   runAction as applyAction,
@@ -1665,13 +2095,21 @@ const meta = moduleMeta('__KEY__')
 const columns = __FIELDS__
 const actions = __ACTIONS__
 const statuses = __STATUSES__
-const stats = __METRICS__
+const metricNames = __METRICS_NAMES__
 
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+const showCreate = ref(false)
+const creating = ref(false)
+const createValues = ref<Record<string, string>>({})
+const stats = computed(() => [
+  { label: metricNames[0], value: total.value },
+  { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
+  { label: metricNames[2], value: rows.value.filter((row) => row.status === statuses[statuses.length - 1]).length },
+])
 const statusSummary = computed(() =>
   statuses.map((status: string) => ({
     status,
@@ -1685,11 +2123,28 @@ function resetFilters() {
 }
 
 function exportRows() {
-  downloadEntries(meta.key)
+  downloadEntries(meta.key, filters.value)
 }
 
 function openCreate() {
-  errorMessage.value = '__ENTITY__登记入口尚未接入审批流'
+  createValues.value = Object.fromEntries(columns.map((field) => [field, '']))
+  errorMessage.value = ''
+  showCreate.value = true
+}
+
+function submitCreate() {
+  creating.value = true
+  errorMessage.value = ''
+  try {
+    const result = createEntry(meta.key, createValues.value)
+    if (!result.ok) throw new Error(result.message)
+    showCreate.value = false
+    reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '登记失败'
+  } finally {
+    creating.value = false
+  }
 }
 
 function runAction(action: string, row: EntryRow) {
@@ -1720,14 +2175,14 @@ onMounted(reload)
 REACT_VIEW_LOCAL = """\
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { downloadEntries, listEntries, moduleMeta, runAction as applyAction } from '@/api/local-service'
+import { createEntry, downloadEntries, listEntries, moduleMeta, runAction as applyAction } from '@/api/local-service'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('__KEY__')
 const columns = __FIELDS__
 const actions = __ACTIONS__
 const statuses = __STATUSES__
-const stats = __METRICS__
+const metricNames = __METRICS_NAMES__
 
 export default function __CLASS__View() {
   const [rows, setRows] = useState<EntryRow[]>([])
@@ -1735,6 +2190,14 @@ export default function __CLASS__View() {
   const [errorMessage, setErrorMessage] = useState('')
   const [filters, setFilters] = useState<Record<string, string>>({})
   const filterFields = useMemo(() => columns.slice(0, 3), [])
+  const [showCreate, setShowCreate] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [createValues, setCreateValues] = useState<Record<string, string>>({})
+  const stats = useMemo(() => [
+    { label: metricNames[0], value: total },
+    { label: metricNames[1], value: rows.filter((row) => row.status === statuses[1]).length },
+    { label: metricNames[2], value: rows.filter((row) => row.status === statuses[statuses.length - 1]).length },
+  ], [rows, total])
 
   const reload = useCallback(() => {
     setErrorMessage('')
@@ -1750,6 +2213,28 @@ export default function __CLASS__View() {
   useEffect(() => {
     reload()
   }, [reload])
+
+  function openCreate() {
+    setCreateValues(Object.fromEntries(columns.map((field) => [field, ''])))
+    setErrorMessage('')
+    setShowCreate(true)
+  }
+
+  function submitCreate(event: React.FormEvent) {
+    event.preventDefault()
+    setCreating(true)
+    setErrorMessage('')
+    try {
+      const result = createEntry(meta.key, createValues)
+      if (!result.ok) throw new Error(result.message)
+      setShowCreate(false)
+      reload()
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '登记失败')
+    } finally {
+      setCreating(false)
+    }
+  }
 
   function runAction(action: string, row: EntryRow) {
     setErrorMessage('')
@@ -1769,10 +2254,10 @@ export default function __CLASS__View() {
           <p className="page-desc">__DESC__</p>
         </div>
         <div className="page-actions">
-          <button className="btn primary" type="button" onClick={() => setErrorMessage('__ENTITY__登记入口尚未接入审批流')}>
+          <button className="btn primary" data-testid="open-create" type="button" onClick={openCreate}>
             登记__ENTITY__
           </button>
-          <button className="btn" type="button" onClick={() => downloadEntries(meta.key)}>
+          <button className="btn" data-testid="export" type="button" onClick={() => downloadEntries(meta.key, filters)}>
             导出__NAME__清单
           </button>
         </div>
@@ -1801,13 +2286,14 @@ export default function __CLASS__View() {
             <span>{field}</span>
             <input
               value={filters[field] ?? ''}
+              data-testid={`filter-${field}`}
               placeholder={`按${field}检索`}
               onChange={(event) => setFilters((prev) => ({ ...prev, [field]: event.target.value }))}
             />
           </label>
         ))}
-        <button className="btn" type="submit">查询</button>
-        <button className="btn ghost" type="button" onClick={() => setFilters({})}>重置条件</button>
+        <button className="btn" data-testid="query" type="submit">查询</button>
+        <button className="btn ghost" data-testid="reset" type="button" onClick={() => setFilters({})}>重置条件</button>
       </form>
 
       <table className="data-table">
@@ -1820,12 +2306,12 @@ export default function __CLASS__View() {
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={String(row.id)}>
+            <tr key={String(row.id)} data-testid={`row-${row.id}`} data-status={String(row.status)}>
               {columns.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
               <td>{row.status}</td>
               <td className="row-actions">
                 {actions.map((action) => (
-                  <button key={action} className="link" type="button" onClick={() => runAction(action, row)}>
+                  <button key={action} data-testid={`action-${row.id}-${action}`} className="link" type="button" onClick={() => runAction(action, row)}>
                     {action}
                   </button>
                 ))}
@@ -1839,6 +2325,31 @@ export default function __CLASS__View() {
           )}
         </tbody>
       </table>
+
+      {showCreate && (
+        <div className="modal-backdrop" data-testid="create-modal">
+          <form className="modal" onSubmit={submitCreate}>
+            <h3>登记__ENTITY__</h3>
+            {columns.map((field) => (
+              <label key={field} className="create-field">
+                <span>{field}</span>
+                <input
+                  value={createValues[field] ?? ''}
+                  data-testid={`create-${field}`}
+                  required
+                  onChange={(event) => setCreateValues((prev) => ({ ...prev, [field]: event.target.value }))}
+                />
+              </label>
+            ))}
+            <div className="page-actions">
+              <button className="btn" type="button" onClick={() => setShowCreate(false)}>取消</button>
+              <button className="btn primary" data-testid="submit-create" type="submit" disabled={creating}>
+                {creating ? '提交中…' : '确认登记'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       <footer className="page-foot">
         <span>共 {total} 条__NAME__记录</span>
@@ -1887,7 +2398,7 @@ DASHBOARD_VUE_LOCAL = """\
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { loadOverview } from '@/api/local-service'
 import type { OverviewResult } from '@/data/types'
@@ -2000,7 +2511,7 @@ __APP_DESC__
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
@@ -2039,7 +2550,7 @@ MAKEFILE_LOCAL = """\
 .PHONY: install frontend build
 
 install:
-\tcd frontend && npm install
+\tcd frontend && npm ci
 
 frontend:
 \tcd frontend && npm run dev
@@ -2053,9 +2564,27 @@ build:
 # 后端：Python（FastAPI）
 # ---------------------------------------------------------------------------
 REQUIREMENTS = """\
-fastapi>=0.110
-uvicorn[standard]>=0.29
-pydantic>=2.6
+# 2026-11-15 在 Python 3.13 干净环境实际安装并通过全栈 E2E 的完整锁定版本。
+annotated-doc==0.0.6
+annotated-types==0.8.0
+anyio==4.16.0
+click==8.5.1
+fastapi==0.163.0
+h11==0.16.0
+httptools==0.9.0
+idna==3.20
+opentelemetry-api==1.45.2
+pydantic==2.14.3
+pydantic_core==2.50.4
+python-dotenv==1.2.4
+PyYAML==6.0.3
+starlette==1.10.0
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+uvicorn==0.54.0
+uvloop==0.23.0
+watchfiles==1.3.0
+websockets==17.4
 """
 
 BACKEND_MAIN = '''\
@@ -2220,6 +2749,13 @@ class EntryPayload(BaseModel):
     values: dict[str, Any] = Field(default_factory=dict)
     remark: str | None = None
 
+
+class ActionPayload(BaseModel):
+    """状态动作使用独立契约，避免与登记的 values 载荷混用。"""
+
+    action: str
+    remark: str | None = None
+
 __SCHEMAS__
 '''
 
@@ -2227,11 +2763,13 @@ ROUTER_PY = '''\
 """__NAME__接口：维护__ENTITY__，覆盖__ACTION_JOIN__等动作。"""
 from __future__ import annotations
 
-from typing import Any
+import csv
+import io
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionResult, EntryPayload, PageResult
+from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services.__KEY__ import __CLASS__Service
 
 router = APIRouter(prefix="/api/__KEY__", tags=["__NAME__"])
@@ -2242,18 +2780,51 @@ LIST_FIELDS = __FIELDS__
 STATUSES = __STATUSES__
 
 
+def query_filters(request: Request) -> dict[str, str]:
+    """只接受当前模块声明过的字段，忽略分页等保留参数。"""
+    return {
+        key: value.strip()
+        for key, value in request.query_params.items()
+        if key in LIST_FIELDS and value.strip()
+    }
+
+
 @router.get("", response_model=PageResult[dict])
 def list_entries(
+    request: Request,
     keyword: str | None = Query(default=None, description="按__FIELD0__检索"),
     status: str | None = Query(default=None, description="__STATUS_JOIN__"),
-    page: int = 1,
-    size: int = 20,
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=200),
 ) -> PageResult[dict]:
-    """按__FIELD0__与状态过滤__NAME__列表；没有数据时返回空页，不报错。"""
-    if size > 200:
-        raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    """按页面字段、__FIELD0__关键字与状态过滤__NAME__列表。"""
+    items, total = service.list_entries(
+        filters=query_filters(request), keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/export")
+def export_entries(
+    request: Request,
+    keyword: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+) -> StreamingResponse:
+    """下载当前筛选条件下的 UTF-8 CSV；必须声明在 /{entry_id} 之前。"""
+    items, _ = service.list_entries(
+        filters=query_filters(request), keyword=keyword, status=status, page=1, size=1000000)
+    output = io.StringIO()
+    output.write("\\ufeff")
+    writer = csv.writer(output, lineterminator="\\n")
+    writer.writerow(["id", *LIST_FIELDS, "status"])
+    for item in items:
+        row = []
+        for value in [item.get("id"), *(item.get(field, "") for field in LIST_FIELDS), item.get("status", "")]:
+            text = "" if value is None else str(value)
+            row.append("'" + text if text.startswith(("=", "+", "-", "@")) else text)
+        writer.writerow(row)
+    return StreamingResponse(
+        iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="__KEY__.csv"'})
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -2266,29 +2837,21 @@ def get_entry(entry_id: int) -> dict:
 
 
 @router.post("", response_model=ActionResult)
-def create_entry(payload: EntryPayload) -> ActionResult:
+def create_entry(payload: dict[str, object]) -> ActionResult:
     """登记一条__ENTITY__，缺字段时说明原因而不是静默丢弃。"""
-    entry, missing = service.create_entry(payload.values)
+    entry, missing = service.create_entry(payload)
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
     return ActionResult(ok=True, message="__ENTITY__已登记", entry=entry)
 
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
-def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
+def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
     """对单条__ENTITY__执行__ACTION_JOIN__；不允许的动作会被拦下并说明原因。"""
-    action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
+    entry, message = service.run_action(entry_id, payload.action.strip())
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出__NAME__清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "__KEY__", "total": total, "items": items}
 '''
 
 SERVICE_PY = '''\
@@ -2300,6 +2863,7 @@ from typing import Any
 from app.store import store
 
 MODULE = "__KEY__"
+LIST_FIELDS = __FIELDS__
 REQUIRED_FIELDS = __REQUIRED_FIELDS__
 STATUS_ORDER = __STATUSES__
 ACTION_RULES = __ACTION_RULES__
@@ -2310,18 +2874,21 @@ class __CLASS__Service:
     def list_entries(
         self,
         *,
+        filters: dict[str, str] | None = None,
         keyword: str | None = None,
         status: str | None = None,
         page: int = 1,
         size: int = 20,
     ) -> tuple[list[dict[str, Any]], int]:
         rows = store.rows(MODULE)
+        for field, expected in (filters or {}).items():
+            rows = [row for row in rows if expected.casefold() in str(row.get(field, "")).casefold()]
         if keyword:
-            rows = [row for row in rows if keyword in str(row.get("__FIELD0__", ""))]
+            rows = [row for row in rows if keyword.casefold() in str(row.get("__FIELD0__", "")).casefold()]
         if status:
             rows = [row for row in rows if row.get("status") == status]
         total = len(rows)
-        start = max(page - 1, 0) * size
+        start = (page - 1) * size
         return rows[start:start + size], total
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
@@ -2333,7 +2900,7 @@ class __CLASS__Service:
             return None, missing
         rows = store.rows(MODULE)
         entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
-        entry.update({field: values.get(field) for field in REQUIRED_FIELDS})
+        entry.update({field: values.get(field) for field in LIST_FIELDS})
         entry["status"] = STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
@@ -2481,8 +3048,13 @@ JAVA_CONTROLLER = """\
 package com.example.__PKG__.controller;
 
 import com.example.__PKG__.service.__CLASS__Service;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -2491,24 +3063,74 @@ import java.util.Map;
 @RequestMapping("/api/__KEY__")
 public class __CLASS__Controller {
 
+    private static final List<String> LIST_FIELDS = List.of(__FIELDS__);
     private final __CLASS__Service service;
 
     public __CLASS__Controller(__CLASS__Service service) {
         this.service = service;
     }
 
-    /** 按__FIELD0__与状态过滤__NAME__列表；没有数据时返回空列表，不抛异常。 */
+    private Map<String, String> filters(Map<String, String> params) {
+        Map<String, String> filters = new LinkedHashMap<>();
+        for (String field : LIST_FIELDS) {
+            String value = params.get(field);
+            if (value != null && !value.isBlank()) {
+                filters.put(field, value.trim());
+            }
+        }
+        return filters;
+    }
+
+    /** 按页面字段、__FIELD0__关键字与状态过滤__NAME__列表。 */
     @GetMapping
     public Map<String, Object> list(
+            @RequestParam Map<String, String> params,
             @RequestParam(required = false) String keyword,
             @RequestParam(required = false) String status,
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "20") int size) {
-        if (size > 200) {
-            throw new IllegalArgumentException("每页最多 200 条，请缩小分页范围");
+        if (page < 1 || size < 1 || size > 200) {
+            throw new IllegalArgumentException("分页必须满足 page >= 1 且 1 <= size <= 200");
         }
-        List<Map<String, Object>> items = service.list(keyword, status, page, size);
-        return Map.of("items", items, "total", service.count(keyword, status), "page", page, "size", size);
+        Map<String, String> filters = filters(params);
+        List<Map<String, Object>> items = service.list(filters, keyword, status, page, size);
+        return Map.of("items", items, "total", service.count(filters, keyword, status), "page", page, "size", size);
+    }
+
+    /** 下载当前筛选条件下的 UTF-8 CSV。 */
+    @GetMapping("/export")
+    public ResponseEntity<byte[]> export(
+            @RequestParam Map<String, String> params,
+            @RequestParam(required = false) String keyword,
+            @RequestParam(required = false) String status) {
+        List<Map<String, Object>> items = service.list(filters(params), keyword, status, 1, 1000000);
+        StringBuilder csv = new StringBuilder("\\ufeff");
+        csv.append(csvCell("id"));
+        for (String field : LIST_FIELDS) {
+            csv.append(',').append(csvCell(field));
+        }
+        csv.append(',').append(csvCell("status"));
+        csv.append('\\n');
+        for (Map<String, Object> item : items) {
+            csv.append(csvCell(String.valueOf(item.get("id"))));
+            for (String field : LIST_FIELDS) {
+                csv.append(',').append(csvCell(String.valueOf(item.getOrDefault(field, ""))));
+            }
+            csv.append(',').append(csvCell(String.valueOf(item.getOrDefault("status", ""))));
+            csv.append('\\n');
+        }
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=__KEY__.csv")
+                .contentType(new MediaType("text", "csv", StandardCharsets.UTF_8))
+                .body(csv.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String csvCell(String value) {
+        String text = value == null ? "" : value;
+        if (text.startsWith("=") || text.startsWith("+") || text.startsWith("-") || text.startsWith("@")) {
+            text = "'" + text;
+        }
+        return "\\\"" + text.replace("\\\"", "\\\"\\\"") + "\\\"";
     }
 
     /** 读取单条__ENTITY__明细；不存在时给出可读的错误说明。 */
@@ -2535,13 +3157,6 @@ public class __CLASS__Controller {
         String action = String.valueOf(payload.getOrDefault("action", ""));
         return service.runAction(id, action);
     }
-
-    /** 导出__NAME__清单：返回当前过滤条件下的全量数据。 */
-    @GetMapping("/export")
-    public Map<String, Object> export() {
-        List<Map<String, Object>> items = service.list(null, null, 1, 10000);
-        return Map.of("module", "__KEY__", "total", items.size(), "items", items);
-    }
 }
 """
 
@@ -2556,6 +3171,7 @@ import java.util.*;
 @Service
 public class __CLASS__Service implements ModuleService {
 
+    private static final List<String> LIST_FIELDS = List.of(__FIELDS__);
     private static final List<String> REQUIRED_FIELDS = List.of(__REQUIRED_FIELDS__);
     private static final List<String> STATUS_ORDER = List.of(__STATUSES__);
     private static final Map<String, String> ACTION_RULES = Map.of(__ACTION_RULES__);
@@ -2578,7 +3194,7 @@ public class __CLASS__Service implements ModuleService {
         for (int index = 0; index < 3; index++) {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("id", ++sequence);
-            for (String field : REQUIRED_FIELDS) {
+            for (String field : LIST_FIELDS) {
                 row.put(field, field + "样例" + (index + 1));
             }
             row.put("status", STATUS_ORDER.get(Math.min(index, STATUS_ORDER.size() - 1)));
@@ -2588,9 +3204,9 @@ public class __CLASS__Service implements ModuleService {
         }
     }
 
-    public List<Map<String, Object>> list(String keyword, String status, int page, int size) {
-        List<Map<String, Object>> filtered = filter(keyword, status);
-        int from = Math.max(0, (page - 1) * size);
+    public List<Map<String, Object>> list(Map<String, String> filters, String keyword, String status, int page, int size) {
+        List<Map<String, Object>> filtered = filter(filters, keyword, status);
+        int from = (page - 1) * size;
         int to = Math.min(filtered.size(), from + size);
         if (from >= to) {
             return List.of();
@@ -2599,20 +3215,42 @@ public class __CLASS__Service implements ModuleService {
     }
 
     @Override
-    public int count(String keyword, String status) {
-        return filter(keyword, status).size();
+    public int count(Map<String, String> filters, String keyword, String status) {
+        return filter(filters, keyword, status).size();
     }
 
-    private List<Map<String, Object>> filter(String keyword, String status) {
+    @Override
+    public int flaggedCount(String flag) {
+        int count = 0;
+        for (Map<String, Object> row : rows) {
+            if (Boolean.TRUE.equals(row.get(flag))) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private List<Map<String, Object>> filter(Map<String, String> filters, String keyword, String status) {
         List<Map<String, Object>> filtered = new ArrayList<>();
         for (Map<String, Object> row : rows) {
-            if (status != null && !status.equals(row.get("status"))) {
+            if (status != null && !status.isBlank() && !status.equals(row.get("status"))) {
                 continue;
             }
-            if (keyword != null && !String.valueOf(row.get(REQUIRED_FIELDS.get(0))).contains(keyword)) {
+            if (keyword != null && !keyword.isBlank()
+                    && !String.valueOf(row.get(LIST_FIELDS.get(0))).toLowerCase().contains(keyword.toLowerCase())) {
                 continue;
             }
-            filtered.add(row);
+            boolean matches = true;
+            for (Map.Entry<String, String> entry : filters.entrySet()) {
+                String actual = String.valueOf(row.getOrDefault(entry.getKey(), ""));
+                if (!actual.toLowerCase().contains(entry.getValue().toLowerCase())) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                filtered.add(row);
+            }
         }
         return filtered;
     }
@@ -2635,7 +3273,7 @@ public class __CLASS__Service implements ModuleService {
     public Map<String, Object> create(Map<String, Object> values) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("id", ++sequence);
-        for (String field : REQUIRED_FIELDS) {
+        for (String field : LIST_FIELDS) {
             row.put(field, values.get(field));
         }
         row.put("status", STATUS_ORDER.get(0));
@@ -2699,14 +3337,19 @@ public class OverviewController {
 JAVA_MODULE_SERVICE = """\
 package com.example.__PKG__.service;
 
+import java.util.Map;
+
 /** 各业务模块共用的能力：给出模块名与记录条数，供概览页汇总。 */
 public interface ModuleService {
 
     /** 模块中文名。 */
     String label();
 
-    /** 按关键字与状态统计记录条数。 */
-    int count(String keyword, String status);
+    /** 按页面字段、关键字与状态统计记录条数。 */
+    int count(Map<String, String> filters, String keyword, String status);
+
+    /** 统计指定布尔标记的记录数。 */
+    int flaggedCount(String flag);
 }
 """
 
@@ -2738,19 +3381,23 @@ public class OverviewService {
         List<Map<String, Object>> modules = new ArrayList<>();
         int created = 0;
         for (ModuleService service : moduleServices) {
-            int rows = service.count(null, null);
+            int rows = service.count(Map.of(), null, null);
             created += rows;
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("name", service.label());
             item.put("created", rows);
-            item.put("pending", 0);
-            item.put("abnormal", 0);
+            item.put("pending", service.flaggedCount("pending"));
+            item.put("abnormal", service.flaggedCount("abnormal"));
             modules.add(item);
         }
+        int pending = modules.stream().mapToInt(item -> (int) item.get("pending")).sum();
+        int abnormal = modules.stream().mapToInt(item -> (int) item.get("abnormal")).sum();
         return Map.of(
                 "cards", List.of(
                         Map.of("label", "业务模块", "value", moduleServices.size()),
-                        Map.of("label", "今日新增", "value", created)),
+                        Map.of("label", "今日新增", "value", created),
+                        Map.of("label", "待处理", "value", pending),
+                        Map.of("label", "异常量", "value", abnormal)),
                 "modules", modules);
     }
 }
@@ -2770,8 +3417,8 @@ logging:
 FRONTEND_DOCKERFILE = """\
 FROM node:20-alpine
 WORKDIR /srv/web
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY . .
 EXPOSE __FRONTEND_PORT__
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
@@ -2911,6 +3558,9 @@ def gen_frontend_vue(spec: dict, out: Path) -> int:
     files[fe / "package.json"] = render(
         PACKAGE_JSON_VUE, APP_SLUG=spec["app_slug"], FRONTEND_PORT=spec["port_frontend"],
         REPO_KIND="frontend-only" if frontend_only else "fullstack")
+    files[fe / "package-lock.json"] = render(
+        (SKILL_DIR / "templates/package-lock-vue.json").read_text(encoding="utf-8"),
+        APP_SLUG=spec["app_slug"])
     files[fe / "vite.config.ts"] = (
         render(VITE_CONFIG_VUE_LOCAL, FRONTEND_PORT=spec["port_frontend"]) if frontend_only
         else render(VITE_CONFIG_VUE, FRONTEND_PORT=spec["port_frontend"],
@@ -2941,6 +3591,15 @@ def gen_frontend_vue(spec: dict, out: Path) -> int:
         files[fe / "src/api/local-service.ts"] = LOCAL_SERVICE_TS
     else:
         files[fe / "src/api/client.ts"] = CLIENT_TS
+    files[fe / "playwright.config.ts"] = PLAYWRIGHT_CONFIG_TS
+    files[fe / "tests/functionality.spec.ts"] = render(
+        FUNCTIONALITY_TEST_TS,
+        MODULES=json.dumps([
+            {"key": module["key"], "fields": module["fields"], "actions": module["actions"],
+             "actionTargets": module["action_targets"]}
+            for module in modules
+        ], ensure_ascii=False, indent=2),
+        REPO_KIND="frontend-only" if frontend_only else "fullstack")
 
     view_imports = ["import Overview from '@/views/Overview.vue'"]
     routes = []
@@ -2958,9 +3617,7 @@ def gen_frontend_vue(spec: dict, out: Path) -> int:
             FIELDS=ts_array(module["fields"]),
             ACTIONS=ts_array(module.get("actions") or [f"提交{module['name']}"]),
             STATUSES=ts_array(module.get("statuses") or ["待处理", "处理中", "已完成"]),
-            METRICS=json.dumps(
-                [{"label": label, "value": 0} for label in module_metrics(module)],
-                ensure_ascii=False),
+            METRICS_NAMES=json.dumps(module_metrics(module), ensure_ascii=False),
         )
     files[fe / "src/router/index.ts"] = render(
         ROUTER_TS, VIEW_IMPORTS="\n".join(view_imports), ROUTES="\n".join(routes))
@@ -2989,6 +3646,9 @@ def gen_frontend_react(spec: dict, out: Path) -> int:
     files[fe / "package.json"] = render(
         PACKAGE_JSON_REACT, APP_SLUG=spec["app_slug"], FRONTEND_PORT=spec["port_frontend"],
         REPO_KIND="frontend-only" if frontend_only else "fullstack")
+    files[fe / "package-lock.json"] = render(
+        (SKILL_DIR / "templates/package-lock-react.json").read_text(encoding="utf-8"),
+        APP_SLUG=spec["app_slug"])
     files[fe / "vite.config.ts"] = (
         render(VITE_CONFIG_REACT_LOCAL, FRONTEND_PORT=spec["port_frontend"]) if frontend_only
         else render(VITE_CONFIG_REACT, FRONTEND_PORT=spec["port_frontend"],
@@ -3014,6 +3674,15 @@ def gen_frontend_react(spec: dict, out: Path) -> int:
         files[fe / "src/api/local-service.ts"] = LOCAL_SERVICE_TS
     else:
         files[fe / "src/api/client.ts"] = CLIENT_TS
+    files[fe / "playwright.config.ts"] = PLAYWRIGHT_CONFIG_TS
+    files[fe / "tests/functionality.spec.ts"] = render(
+        FUNCTIONALITY_TEST_TS,
+        MODULES=json.dumps([
+            {"key": module["key"], "fields": module["fields"], "actions": module["actions"],
+             "actionTargets": module["action_targets"]}
+            for module in modules
+        ], ensure_ascii=False, indent=2),
+        REPO_KIND="frontend-only" if frontend_only else "fullstack")
 
     view_imports = []
     routes = []
@@ -3033,8 +3702,7 @@ def gen_frontend_react(spec: dict, out: Path) -> int:
                                 ensure_ascii=False, indent=2),
             STATUSES=json.dumps(module.get("statuses") or ["待处理", "处理中", "已完成"],
                                 ensure_ascii=False, indent=2),
-            METRICS=json.dumps([{"label": label, "value": 0} for label in module_metrics(module)],
-                               ensure_ascii=False, indent=2),
+            METRICS_NAMES=json.dumps(module_metrics(module), ensure_ascii=False, indent=2),
         )
         if frontend_only:
             # 主体识别会跳过 index.tsx 这种入口名，所以组件本身落到 <Key>View.tsx，
@@ -3134,6 +3802,7 @@ def gen_backend_python(spec: dict, out: Path) -> int:
         files[be / f"app/services/{key}.py"] = render(
             SERVICE_PY,
             KEY=key, NAME=module["name"], ENTITY=module["entity"], CLASS=cls,
+            FIELDS=py_list(module["fields"]),
             REQUIRED_FIELDS=py_list(module["fields"][:3]),
             STATUSES=py_list(statuses),
             FIELD0=module["fields"][0],
@@ -3176,10 +3845,12 @@ def gen_backend_java(spec: dict, out: Path) -> int:
         action_rules = list(flow["rules"].items())
         files[be / f"src/main/java/com/example/{pkg}/controller/{cls}Controller.java"] = render(
             JAVA_CONTROLLER, PKG=pkg, KEY=key, NAME=module["name"], ENTITY=module["entity"],
-            CLASS=cls, FIELD0=module["fields"][0], ACTION_JOIN="、".join(actions))
+            CLASS=cls, FIELD0=module["fields"][0], ACTION_JOIN="、".join(actions),
+            FIELDS=", ".join(json.dumps(f, ensure_ascii=False) for f in module["fields"]))
         files[be / f"src/main/java/com/example/{pkg}/service/{cls}Service.java"] = render(
             JAVA_SERVICE, PKG=pkg, KEY=key, NAME=module["name"], ENTITY=module["entity"],
             CLASS=cls,
+            FIELDS=", ".join(json.dumps(f, ensure_ascii=False) for f in module["fields"]),
             REQUIRED_FIELDS=", ".join(json.dumps(f, ensure_ascii=False)
                                       for f in module["fields"][:3]),
             STATUSES=", ".join(json.dumps(s, ensure_ascii=False) for s in statuses),
@@ -3231,11 +3902,9 @@ def repo_kind(spec: dict) -> str:
     return "frontend-only" if spec["backend"] == "none" else "fullstack"
 
 
-def scaffold(spec: dict, out: Path) -> dict:
-    domain_rules.validate(spec)
-    if out.exists() and any(out.iterdir()):
-        raise SystemExit(f"目标目录非空，先清空或换一个目录：{out}")
-    out.mkdir(parents=True, exist_ok=True)
+def _scaffold_in_place(spec: dict, out: Path) -> dict:
+    """在空目录中写文件；外部统一通过原子 scaffold 入口调用。"""
+    out.mkdir(parents=True, exist_ok=False)
     frontend_only = spec["backend"] == "none"
     lines = 0
     lines += gen_frontend_vue(spec, out) if spec["frontend"] == "vue" else gen_frontend_react(spec, out)
@@ -3246,6 +3915,8 @@ def scaffold(spec: dict, out: Path) -> dict:
         out / ".gitignore": GITIGNORE,
         out / "README.md": build_readme(spec) + f"\n领域：{spec['domain']}\n子方向：{spec['subdirection']}\n",
         out / domain_rules.METADATA_FILE: json.dumps(domain_rules.validate(spec), ensure_ascii=False, indent=2) + "\n",
+        # 规范化 spec 随仓库保存，供跨仓库查重和能力验收使用；不含本机路径或凭证。
+        out / ".s11-spec.json": json.dumps(spec, ensure_ascii=False, indent=2) + "\n",
         out / "docker-compose.yml": (
             render(COMPOSE_LOCAL, FRONTEND_PORT=spec["port_frontend"]) if frontend_only
             else render(COMPOSE, BACKEND_PORT=spec["port_backend"],
@@ -3265,6 +3936,31 @@ def scaffold(spec: dict, out: Path) -> dict:
     if run_sh.exists():
         run_sh.chmod(0o755)
     return {"files": sum(1 for _ in out.rglob("*") if _.is_file()), "lines_written": lines}
+
+
+def scaffold(spec: dict, out: Path) -> dict:
+    """完整预检后在同盘临时目录生成，再原子移动到目标位置。
+
+    任何 schema、模板或写盘错误都不会留下一个看似可交付的半成品仓库。
+    """
+    topic_hits = scan_spec_topics(spec) if isinstance(spec, dict) else []
+    if topic_hits:
+        raise SystemExit(banned_topic_report(topic_hits))
+    normalized = normalize_spec(spec)
+    out = Path(out).expanduser().resolve()
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise SystemExit(f"目标目录非空，先清空或换一个目录：{out}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    workspace = Path(tempfile.mkdtemp(prefix=f".{out.name}.build-", dir=out.parent))
+    temporary_out = workspace / "repo"
+    try:
+        result = _scaffold_in_place(normalized, temporary_out)
+        if out.exists():
+            out.rmdir()  # 只允许空目录占位
+        temporary_out.replace(out)
+        return result
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def main() -> int:
@@ -3345,13 +4041,10 @@ def main() -> int:
 
     result = scaffold(spec, out)
 
-    # spec 复制到外层容器（不在仓库 .git 范围内），留作元信息对照
+    # 规范化 spec 已在仓库内保存；外层再留一份便于任务管理，绝不删除用户输入文件。
     if args.parent and args.spec:
         src = Path(args.spec).expanduser().resolve()
-        if src.is_file():
-            shutil.copy2(src, container / src.name)
-            if src.parent == parent:
-                src.unlink()
+        shutil.copy2(out / ".s11-spec.json", container / src.name)
 
     if args.git_init:
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=out, check=True)

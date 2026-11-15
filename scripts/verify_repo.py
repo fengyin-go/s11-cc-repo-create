@@ -387,6 +387,9 @@ def check_forbidden(repo: Path, structure: dict[str, object]) -> dict[str, objec
         if size > MAX_TEXT_FILE_BYTES:
             big_files.append(f"{rel} ({size // 1024}KB)")
             continue
+        # 锁文件含随机 base64 integrity，子串合规词表会把随机片段误判成业务题域。
+        if path.name in LOCK_FILE_NAMES:
+            continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -784,6 +787,77 @@ def rules_drift(path: Path) -> dict[str, object]:
     }
 
 
+def check_functional_contract(repo: Path, structure: dict[str, object], kind: str) -> dict[str, object]:
+    """G8 的静态前置：功能锚点、契约与测试资产必须随每个模块生成。"""
+    problems: list[str] = []
+    try:
+        spec = json.loads((repo / ".s11-spec.json").read_text(encoding="utf-8"))
+        modules = spec["modules"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return {"ok": False, "problems": ["缺少合法的 .s11-spec.json，无法核对功能覆盖"]}
+    frontend_name = str(structure.get("frontend_dir") or "frontend")
+    frontend = repo / frontend_name
+    for relative in ("playwright.config.ts", "tests/functionality.spec.ts", "package-lock.json"):
+        if not (frontend / relative).is_file():
+            problems.append(f"缺少功能验收/依赖复现资产 frontend/{relative}")
+    try:
+        package = json.loads((frontend / "package.json").read_text(encoding="utf-8"))
+        if "test:e2e" not in package.get("scripts", {}):
+            problems.append("frontend/package.json 缺少 test:e2e")
+        if "@playwright/test" not in package.get("devDependencies", {}):
+            problems.append("frontend/package.json 缺少 @playwright/test")
+    except (OSError, json.JSONDecodeError):
+        problems.append("无法读取 frontend/package.json")
+
+    for overview in (frontend / "src/views/Overview.vue", frontend / "src/views/Overview.tsx"):
+        if overview.is_file() and "showCreate" in overview.read_text(encoding="utf-8"):
+            problems.append("概览页误含模块登记弹窗状态")
+    for module in modules:
+        key = module["key"]
+        class_name = "".join(part.capitalize() for part in key.split("_") if part)
+        relative = f"src/views/{key}/index.vue" if structure.get("frontend_stack") == "vue" \
+            else (f"src/views/{key}/{class_name}View.tsx" if kind == "frontend-only"
+                  else f"src/views/{key}/index.tsx")
+        page = frontend / relative
+        if not page.is_file():
+            problems.append(f"模块 {key} 缺少页面 {relative}")
+            continue
+        text = page.read_text(encoding="utf-8", errors="replace")
+        for marker in ("data-testid=", "openCreate", "submitCreate", "runAction"):
+            if marker not in text:
+                problems.append(f"模块 {key} 页面缺少 {marker}")
+        if "尚未接入" in text:
+            problems.append(f"模块 {key} 仍含占位功能")
+        if kind == "fullstack" and structure.get("backend_stack") == "python":
+            router_path = repo / str(structure.get("backend_dir")) / "app/routers" / f"{key}.py"
+            router = router_path.read_text(encoding="utf-8", errors="replace") if router_path.is_file() else ""
+            if "payload: ActionPayload" not in router or "filters=query_filters(request)" not in router:
+                problems.append(f"模块 {key} Python 动作/查询契约不完整")
+            export_position = router.find('@router.get("/export")')
+            detail_position = router.find('@router.get("/{entry_id}"')
+            if export_position < 0 or detail_position < 0 or export_position > detail_position:
+                problems.append(f"模块 {key} 的 /export 仍可能被 /{{entry_id}} 截获")
+            if 'filename="' + key + '.csv"' not in router:
+                problems.append(f"模块 {key} 没有 CSV 下载响应")
+        elif kind == "fullstack" and structure.get("backend_stack") == "java":
+            controller = list((repo / str(structure.get("backend_dir"))).rglob(f"{class_name}Controller.java"))
+            text_java = controller[0].read_text(encoding="utf-8") if controller else ""
+            if "ResponseEntity<byte[]> export" not in text_java or "filters(params)" not in text_java:
+                problems.append(f"模块 {key} Java 查询/CSV 导出契约不完整")
+
+    if kind == "frontend-only":
+        service = frontend / "src/api/local-service.ts"
+        text = service.read_text(encoding="utf-8") if service.is_file() else ""
+        for marker in ("createEntry", "csvCell", "filterRows", "downloadEntries"):
+            if marker not in text:
+                problems.append(f"纯前端本地服务缺少 {marker}")
+    elif (repo / "docker-compose.yml").is_file():
+        compose = (repo / "docker-compose.yml").read_text(encoding="utf-8")
+        if "VITE_PROXY_TARGET: http://backend:" not in compose:
+            problems.append("docker-compose.yml 未把前端代理指向 backend 服务名")
+    return {"ok": not problems, "problems": problems, "modules_checked": len(modules)}
+
+
 def verify(repo: Path, *, min_lines: int, min_capacity: int, per_mode: int,
            per_subject: int, kind: str = "auto") -> dict[str, object]:
     resolved_kind = detect_repo_kind(repo) if kind == "auto" else kind
@@ -797,6 +871,7 @@ def verify(repo: Path, *, min_lines: int, min_capacity: int, per_mode: int,
     checks["capacity"] = check_capacity(repo, min_capacity=min_capacity,
                                         per_mode=per_mode, per_subject=per_subject)
     checks["env_preconditions"] = check_env_preconditions(repo, checks["structure"])
+    checks["functional_contract"] = check_functional_contract(repo, checks["structure"], resolved_kind)
     checks["compliance"] = check_forbidden(repo, checks["structure"])
 
     failures: list[str] = []
@@ -812,6 +887,7 @@ def verify(repo: Path, *, min_lines: int, min_capacity: int, per_mode: int,
         "capacity": "G5 出题容量",
         "compliance": "G6 内容合规",
         "env_preconditions": "G7 基础环境自洽",
+        "functional_contract": "G8 功能契约前置",
     }
     for key, label in label_map.items():
         if not checks[key]["ok"]:

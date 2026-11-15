@@ -43,6 +43,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import verify_repo as verifier  # noqa: E402
 import repo_rules as rules  # noqa: E402
 import github_settings
+import check_similarity
 
 DEFAULT_BRANCH = "main"
 
@@ -192,6 +193,43 @@ def configure_origin(repo: Path, url: str, branch: str) -> None:
     run(["git", "config", "--unset-all", f"branch.{branch}.pushRemote"], cwd=repo)
 
 
+def check_delivery_evidence(repo: Path, head: str) -> dict[str, object]:
+    """s11 仓库发布必须携带绑定当前 HEAD 的查重与全功能验收证据。"""
+    if not ((repo / ".s11-domain.json").is_file() or (repo / ".s11-spec.json").is_file()):
+        return {"ok": True, "problems": [], "skipped": "非 s11 生成仓库"}
+    problems: list[str] = []
+    reports: dict[str, object] = {}
+    for name in ("probe-report.json", "similarity-report.json"):
+        path = repo.parent / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            problems.append(f"缺少或无法读取 {path}；先运行完整流水线验收")
+            continue
+        reports[name] = payload
+        if payload.get("ok") is not True:
+            problems.append(f"{name} 的 ok 不是 true")
+        if payload.get("source_head") != head:
+            problems.append(f"{name} 未绑定当前 HEAD {head[:12]}，需重新验收")
+    probe = reports.get("probe-report.json")
+    if isinstance(probe, dict):
+        if probe.get("cleaned_up") is not True:
+            problems.append("probe-report.json 未证明进程与资源清理完成")
+        steps = probe.get("steps") or []
+        if not any(step.get("ok") is True and str(step.get("step", "")).endswith("浏览器全功能验收")
+                   for step in steps if isinstance(step, dict)):
+            problems.append("probe-report.json 缺少浏览器全功能验收通过记录")
+    similarity = reports.get("similarity-report.json")
+    if isinstance(similarity, dict) and (repo / ".s11-spec.json").is_file():
+        try:
+            spec = json.loads((repo / ".s11-spec.json").read_text(encoding="utf-8"))
+            if similarity.get("fingerprint") != check_similarity.fingerprint(spec):
+                problems.append("similarity-report.json 的业务指纹与当前 .s11-spec.json 不一致")
+        except (OSError, json.JSONDecodeError):
+            problems.append("无法核对 .s11-spec.json 业务指纹")
+    return {"ok": not problems, "problems": problems, "reports": sorted(reports)}
+
+
 def publish(args) -> dict[str, object]:
     repo = Path(args.repo).expanduser().resolve()
     branch = args.branch
@@ -213,9 +251,13 @@ def publish(args) -> dict[str, object]:
     report["commit"] = head
 
     status = run(["git", "status", "--porcelain"], cwd=repo).stdout.strip()
-    if status and not args.allow_dirty:
+    is_s11 = (repo / ".s11-domain.json").is_file() or (repo / ".s11-spec.json").is_file()
+    dirty_blocked = bool(status) and (not args.allow_dirty or is_s11)
+    if dirty_blocked:
         problems.append("工作区有未提交改动，先提交再推：" + "；".join(status.splitlines()[:5]))
-    report["steps"].append({"step": "工作区干净", "ok": not status or args.allow_dirty,
+    if args.execute and args.skip_verify and is_s11:
+        problems.append("s11 生成仓库发布不能使用 --skip-verify")
+    report["steps"].append({"step": "工作区干净", "ok": not dirty_blocked,
                             "detail": status[:200] or "clean"})
 
     if not args.skip_verify:
@@ -226,6 +268,14 @@ def publish(args) -> dict[str, object]:
                                 else "；".join(result["failures"])[:400]})
         if not result["ok"]:
             problems.append("静态验收没过，先修好再推（或显式 --skip-verify）")
+
+    if args.execute:
+        evidence = check_delivery_evidence(repo, head)
+        report["steps"].append({
+            "step": "当前 HEAD 的查重与全功能验收证据", "ok": evidence["ok"],
+            "detail": "；".join(evidence["problems"]) or "报告有效",
+        })
+        problems.extend(evidence["problems"])
 
     if problems:
         report.update(ok=False, problems=problems)
@@ -272,7 +322,8 @@ def publish(args) -> dict[str, object]:
     # 生成的仓库必须是公开的：下游（GSB 容器）要能匿名 clone，private 会直接卡住出题链路。
     # 所以这里核对真实可见性，和请求的不一致就改过来，并把前后值都写进报告，不做无声修改。
     if full_name and remote_ready:
-        visibility = ensure_visibility(full_name, args.visibility, execute=args.execute)
+        # 先只规划；远端分叉或证据失败时不得提前改动已有仓库可见性。
+        visibility = ensure_visibility(full_name, args.visibility, execute=False)
         report["visibility_before"] = visibility.get("before")
         report["visibility_after"] = visibility.get("after")
         report["visibility_will_fix"] = visibility.get("will_fix")
@@ -322,6 +373,16 @@ def publish(args) -> dict[str, object]:
             next_cmd += ["--remote-url", url]
         report["next"] = shlex.join(next_cmd)
         return report
+
+    if full_name and remote_ready and report.get("visibility_will_fix"):
+        visibility = ensure_visibility(full_name, args.visibility, execute=True)
+        report["visibility_after"] = visibility.get("after")
+        report["visibility_will_fix"] = False
+        report["visibility_fixed"] = visibility.get("fixed")
+        if visibility.get("problems"):
+            report["ok"] = False
+            report["problems"] = list(visibility["problems"])
+            return report
 
     configure_origin(repo, url, branch)
     if action != "up-to-date":
