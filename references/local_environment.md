@@ -16,7 +16,7 @@
 ~/.kunlunxiaozhi/skills/s11-cc-repo-create
 ```
 
-下文用 `<skill>` 指代这个目录。所有脚本都在 `<skill>/scripts/` 下，不依赖任何其他 skill。
+下文用 `<skill>` 指代这个目录。生成/启动脚本在本目录；正式困难容量校验必须使用本机当前的 `s11-gsb-prompt-create`，默认位于 `~/.codex/skills/s11-gsb-prompt-create`，也可通过 `S11_PROMPT_SKILL` 指定。本文件工具/账号记录是2026-11-12历史快照，运行时重新核验，不当作当前已验证证据。
 
 ## 运行时（全部走 PATH，无需写绝对路径）
 
@@ -47,7 +47,7 @@ Java 版的 G8 一律按未验证处理，不能写成已通过。
 - **凭证**：`gh` 已登录 `daofaziran888`（活跃账号），已通过 `github_settings.py` 验证 (`credential_valid: true`)
 - 每次脚本运行时 `github.local.json` 的 owner 会覆盖默认的 fengyin-go，凭证从 gh 的 daofaziran888 token 读取
 - **不需要**本机另登录 `fengyin-go`，不需要全局 `gh auth switch`
-- 如需切回 `fengyin-solo` 或其他账号：修改 `github.local.json` 的 owner，并用 `gh auth token --hostname github.com --user <账号>` 确认该账号已登录
+- S11下游禁止活跃账号 `fengyin-solo`；不要为恢复自动切至该账号。当前配置与下游活跃身份不兼容时报告阻塞，不静默切换或打印token。
 
 ## 命令注意事项
 
@@ -59,7 +59,7 @@ Java 版的 G8 一律按未验证处理，不能写成已通过。
    python3 ~/.kunlunxiaozhi/skills/s11-cc-repo-create/scripts/run_pipeline.py \
      --parent "/Users/fengyin/项目/字节/solo11/s11任务目录 1" \
      --spec ~/.kunlunxiaozhi/skills/s11-cc-repo-create/examples/spec-data-engineering.json \
-     --publish --confirm PUBLISH
+     --skip-probe  # 仅生成草稿；增强业务/题位后用 --prepared-repo --publish 验收发布
    ```
 
 3. **真启动探针会联网**：`probe_startup.py` 会用锁文件执行 `npm ci`、安装 Python 锁定依赖并准备 Playwright Chromium，需要 npm registry、PyPI 与浏览器下载源可达。
@@ -76,4 +76,5 @@ Java 版的 G8 一律按未验证处理，不能写成已通过。
 3. 用 `gh auth login --hostname github.com` 登录目标账号
 4. 执行 `python3 <skill>/scripts/github_settings.py` 验证
 5. 执行 `python3 -m unittest discover -s <skill>/tests -v` 跑自测
-6. 更新本文件记录新电脑的工具版本和路径
+6. 安装本机当前 `s11-gsb-prompt-create` 及其声明依赖，设置 `S11_PROMPT_SKILL`（若不在默认位置）
+7. 更新本文件记录新电脑的工具版本和路径

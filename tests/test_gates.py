@@ -57,12 +57,18 @@ def generate(target: Path, *extra: str) -> dict:
     if result.returncode != 0:
         raise AssertionError(f"生成失败：{result.stderr}")
     payload = json.loads(result.stdout)
-    # 发布单测使用本地裸仓库，不跑昂贵 E2E；写入与真实探针同结构的有效证据。
+    # 发布单测使用本地裸仓库，不跑真实启动；写入与smoke同结构的模拟证据（仅限单测）。
     if (target / ".git").exists():
         head = git("-C", str(target), "rev-parse", "HEAD").stdout.strip()
         (target.parent / "probe-report.json").write_text(json.dumps({
-            "ok": True, "source_head": head, "cleaned_up": True,
-            "steps": [{"step": "克隆内：浏览器全功能验收", "ok": True}],
+            "ok": True, "mode": "clean-clone", "source_head": head, "cleaned_up": True,
+            "verification_scope": "startup-connectivity",
+            "steps": [{"step": "克隆内：前端首页可访问且有挂载点", "ok": True},
+                      {"step": "克隆内：前端安装依赖", "ok": True},
+                      {"step": "克隆内：后端安装依赖", "ok": True},
+                      {"step": "克隆内：后端 /api/health 就绪", "ok": True},
+                      {"step": "克隆内：前端 -> 后端代理链路通", "ok": True},
+                      {"step": "克隆内：前端入口脚本可加载", "ok": True}],
         }), encoding="utf-8")
         spec = json.loads((target / ".s11-spec.json").read_text(encoding="utf-8"))
         import check_similarity
@@ -85,6 +91,19 @@ class ScaffoldAndVerify(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        # These legacy tests isolate Git fast-forward/idempotency, not G10.
+        # Capacity has separate fail-closed integration tests; no fake on-disk pass report.
+        if self._testMethodName in {
+            "test_publish_pushes_main_then_is_idempotent",
+            "test_publish_fast_forwards_new_commits",
+            "test_publish_refuses_diverged_remote",
+        }:
+            capacity = patch.object(publisher.check_prompt_capacity, "check_capacity",
+                                    return_value={"ok": True, "qualified_plan_count": 35})
+            capacity.start()
+            self.addCleanup(capacity.stop)
 
     def verify(self, repo: Path | None = None, **kwargs) -> dict:
         return verifier.verify(repo or self.repo, min_lines=kwargs.pop("min_lines", 2000),
@@ -1009,11 +1028,13 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("禁止同时使用", result.stderr)
         self.assertFalse((self.tmp / "gen" / "cc10001").exists())
 
-    def test_pipeline_refuses_publish_without_confirmation(self):
+    def test_pipeline_does_not_ask_for_confirmation_but_rejects_unready_draft(self):
         result = self.pipeline("--spec", str(SPEC), "--publish")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--confirm PUBLISH", result.stderr)
-        self.assertFalse((self.tmp / "gen").exists(), "参数被拒时不该落下任何仓库")
+        self.assertNotIn("需要配合 --confirm", result.stderr)
+        report = json.loads(result.stdout[result.stdout.index("{"):])
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("容量" in str(r.get("failed_step", "")) for r in report["repos"]))
 
     def test_pipeline_preflight_refuses_invalid_spec_without_partial_generation(self):
         """所有输入先预检；首份违规时不会留下部分批次。"""
@@ -1033,27 +1054,16 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(report["stage"], "批量预检")
         self.assertFalse((self.tmp / "gen" / "cc10001").exists())
 
-    def test_pipeline_publishes_to_a_remote_and_confirms_sha(self):
-        """推送这一步真的接上了：推到本地裸仓库，远端 main 的 SHA 必须等于本地 HEAD。"""
+    def test_pipeline_draft_cannot_bypass_capacity_via_local_remote(self):
+        """A local/bare remote is not a G10 escape hatch, and should not run E2E first."""
         bare = self.tmp / "origin.git"
         subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
-        result = self.pipeline("--spec", str(SPEC), "--publish", "--confirm", "PUBLISH",
-                               "--remote-url", str(bare))
-        self.assertEqual(result.returncode, 0, msg=result.stdout[-1200:])
+        result = self.pipeline("--spec", str(SPEC), "--publish", "--remote-url", str(bare))
+        self.assertNotEqual(result.returncode, 0)
         report = json.loads(result.stdout[result.stdout.index("{"):])
-        self.assertTrue(report["published"])
-        repo = report["repos"][0]
-        self.assertTrue(repo["ok"])
-        self.assertTrue(repo["steps"]["推送 GitHub"])
-        self.assertTrue(repo["remote_matches_local"])
+        self.assertFalse(report["ok"])
+        self.assertNotEqual(git("--git-dir", str(bare), "rev-parse", "--verify", "main").returncode, 0)
 
-        remote_sha = subprocess.run(
-            ["git", "--git-dir", str(bare), "rev-parse", "main"],
-            capture_output=True, text=True, check=True).stdout.strip()
-        local_sha = subprocess.run(
-            ["git", "-C", repo["repo_root"], "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True).stdout.strip()
-        self.assertEqual(remote_sha, local_sha)
 
 
 if __name__ == "__main__":

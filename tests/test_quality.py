@@ -137,7 +137,7 @@ class QualityGatesTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertGreaterEqual(result["nearest"]["source_structure"], check_similarity.STRUCTURE_THRESHOLD)
 
-    def test_delivery_evidence_requires_current_head_and_real_e2e_step(self):
+    def test_delivery_evidence_requires_current_head_and_complete_connectivity(self):
         repo = self.root / "app"
         scaffold_repo.scaffold(self.spec, repo)
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
@@ -149,18 +149,25 @@ class QualityGatesTest(unittest.TestCase):
         missing = publish_github.check_delivery_evidence(repo, head)
         self.assertFalse(missing["ok"])
         (repo.parent / "probe-report.json").write_text(json.dumps({
-            "ok": True, "source_head": head, "cleaned_up": True,
+            "ok": True, "mode": "clean-clone", "source_head": head, "cleaned_up": True,
+            "verification_scope": "startup-connectivity",
             "steps": [{"step": "克隆内：后端 /api/health 就绪", "ok": True}],
         }), encoding="utf-8")
         (repo.parent / "similarity-report.json").write_text(json.dumps({
             "ok": True, "source_head": head, "fingerprint": check_similarity.fingerprint(self.spec),
         }), encoding="utf-8")
-        no_e2e = publish_github.check_delivery_evidence(repo, head)
-        self.assertFalse(no_e2e["ok"])
-        self.assertTrue(any("浏览器全功能" in problem for problem in no_e2e["problems"]))
+        incomplete = publish_github.check_delivery_evidence(repo, head)
+        self.assertFalse(incomplete["ok"])
+        self.assertTrue(any("前端 -> 后端代理链路通" in problem for problem in incomplete["problems"]))
         probe_path = repo.parent / "probe-report.json"
         probe = json.loads(probe_path.read_text())
-        probe["steps"].append({"step": "克隆内：浏览器全功能验收", "ok": True})
+        probe["steps"].extend([
+            {"step": "克隆内：前端首页可访问且有挂载点", "ok": True},
+            {"step": "克隆内：前端安装依赖", "ok": True},
+            {"step": "克隆内：后端安装依赖", "ok": True},
+            {"step": "克隆内：前端 -> 后端代理链路通", "ok": True},
+            {"step": "克隆内：前端入口脚本可加载", "ok": True},
+        ])
         probe_path.write_text(json.dumps(probe), encoding="utf-8")
         self.assertTrue(publish_github.check_delivery_evidence(repo, head)["ok"])
         stale = publish_github.check_delivery_evidence(repo, "0" * 40)

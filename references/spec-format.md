@@ -1,6 +1,6 @@
 # spec 格式：怎么描述一个要生成的应用
 
-生成器只认一份 JSON。默认 spec 在 `examples/spec-data-engineering.json`（数据工程链路开发平台，18 个模块）。
+生成器只认一份 JSON。它生成的是可启动草稿，须经agent增强真实数据流和容量审计后才能正式交付；见 [capacity-design.md](capacity-design.md)。默认 spec 在 `examples/spec-data-engineering.json`（数据工程链路开发平台，18 个模块）。
 领域固定 `数据工程`，子方向选择 `数据采集、爬虫与RPA` / `数仓与数据湖` / `数据分析与数据应用` 中一个。
 
 **改完先过一遍严禁题域自检**（命中即废题，没有绕过参数）：
@@ -48,7 +48,7 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 | `backend` | | `python`（默认，FastAPI）、`java`（Spring Boot 17），或 `none`（**纯前端仓库**，不生成后端）；可被 `--backend` 覆盖 |
 | `port_frontend` | | 前端端口，默认 5173 |
 | `port_backend` | | 后端端口，默认 8000（`backend: none` 时不使用） |
-| `modules` | ✓ | 业务模块数组，**至少 16 个**才能保证容量 >= 30 |
+| `modules` | ✓ | 业务模块数组，脚手架兼容下限16个；只能保证旧扫描公式下限，不能保证35道困难题。新仓按真实业务设计约20～24个topic并通过容量契约 |
 
 ## 模块字段
 
@@ -78,18 +78,11 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 | `metrics` | | 如填写必须正好 3 项；数值由当前数据动态计算，不再是固定常量 |
 | `desc` | | 覆盖自动生成的页面说明 |
 
-## 怎么写出「撑得起 30 条」的 spec
+## 怎么设计能产35道困难题的底座
 
-1. **模块数 >= 16**。少于 16 个主体，容量公式里的「主体数 × 2」就先卡住了。
-2. **每个模块的 `fields` 写 6~8 个业务字段，别写「用户名 / 状态 / 数据」这类泛词**。
-   主体识别会过滤掉 `GENERIC_TOKENS` 里的泛用词，泛词写多了这个文件派不出主体。
-3. **`fields` / `statuses` / `actions` 要用具体业务词**：`增量游标`、`分区保留`、`异常行隔离`
-   这种能撑起「规则与阈值」「状态流转」「边界与空态」等多种需求模式的题面；
-   `数据管理`、`信息维护` 这种则会把所有题挤进同一格。
-4. **模块之间业务对象要拉开**。同一主体 + 同一需求模式只能出一条题，
-   16 个彼此独立的业务域比 16 个「XX 管理」更经得起出题。
-5. **动作至少 2~3 个且方向不同**（正向推进 + 打回/作废），这样「状态流转」和
-   「缺陷处置」两类题都有落点。
+至少16模块只是历史草稿兼容约束；不要只填写更多CRUD字段就宣称容量成立。按 [capacity-design.md](capacity-design.md) 设计约20～24个真实topic和贯通数据流，准备约42个原始候选，实际实现业务后保留至少35个合格H1/H2/H3 v2题位。
+
+字段/状态/动作使用具体数据语义；既要区分业务对象，也要形成真正的跨模块数据消费。独立页面、文件数、动作按钮数均不是困难题容量证据。请先设计真实输入、加工产物与消费者，再选择CRUD、DAG、时间线等展示形态；不能反过来用展示形态证明真实数据链路。
 
 ## 生成出来的目录
 
@@ -101,7 +94,7 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 │   ├── src/api/client.ts               统一请求封装
 │   ├── src/stores/session.ts           会话状态（React 版省略）
 │   ├── vite.config.ts                  server.open = false
-│   ├── tests/functionality.spec.ts      全模块浏览器功能验收
+│   ├── tests/functionality.spec.ts      首次整体测试可用；最终smoke不运行
 │   ├── playwright.config.ts            Chromium E2E 配置
 │   └── package.json / package-lock.json / index.html / tsconfig.json
 ├── backend/                  FastAPI 或 Spring Boot

@@ -1,7 +1,9 @@
 # 硬性要求与容量口径
 
+> 2026-11-16：以下G5旧公式只保留为草稿静态下限。正式底座另须通过 `check_prompt_capacity.py`：至少35个真实下游领域/类型/H1/H2/H3 v2题位；CRUD页数与源码行数不能替代。详见 [capacity-design.md](capacity-design.md)。新增无人值守、并行和一测一改/最终联通验收规则以SKILL.md及[parallel-performance.md](parallel-performance.md)为准。
+
 这个 skill 生成的每个仓库都要过 G0～G7 静态闸门与 G8 功能契约前置，全部由 `scripts/verify_repo.py` 机器复核；
-再由 `scripts/probe_startup.py` 做干净克隆真启动和浏览器全功能 E2E，由 `scripts/check_similarity.py` 做 G9 跨仓库查重。任何一道不过就不算生成完成。
+再由 `scripts/probe_startup.py` 做最终干净克隆启动联通检查（不再全量E2E/构建），由 `scripts/check_similarity.py` 做 G9 跨仓库查重。任何一道不过就不算生成完成。
 
 | 闸门 | 要求 | 由谁判 |
 |---|---|---|
@@ -10,10 +12,11 @@
 | G2 启动 | 前端 dev server 关掉「自动打开页面」 | `verify_repo.py` |
 | G3 忽略 | 根目录 `.gitignore` 覆盖依赖 / 缓存 / 构建产物 / 日志 / 环境文件 | `verify_repo.py` |
 | G4 体量 | 源码行数 >= 2000 行（不含依赖目录、构建产物、锁文件） | `verify_repo.py` |
-| G5 容量 | 出题容量 >= 30 条 | `verify_repo.py` |
+| G5 草稿容量 | 旧静态公式>=30，不证明困难题有效容量 | `verify_repo.py` |
 | G6 合规 | 不是禁用题型仓库，无密钥、无超大文件、无违规业务域，且题域不命中 0731 严禁出题清单 | `verify_repo.py` |
 | G7 环境 | 基础环境自洽：Python 全量可编译、后端入口能 import、依赖都声明、没有写死本机路径 | `verify_repo.py` |
-| G8 功能 | 静态逐模块功能契约；干净克隆里装依赖、起服务、验接口/代理、跑全模块浏览器 E2E、生产构建；纯前端跳过不存在的后端/代理，但须验 localStorage 持久化；进程和临时克隆均清理 | `verify_repo.py` + `probe_startup.py` |
+| G8 功能 | 静态逐模块功能契约；一次整体测试/至多一次集中修复后，干净克隆装依赖、起服务、验首页/入口/health/代理；不重复全量E2E或构建；纯前端跳过不存在的后端/代理；进程和临时克隆均清理 | `verify_repo.py` + `probe_startup.py` |
+| G10 困难容量 | >=35个当前下游语义题位；领域/类型/H1/H2/H3 v2及业务源码证据 | `check_prompt_capacity.py`，publisher每次正式发布前复核 |
 | G9 差异 | 整批 spec 与历史业务指纹预检，生成后再比较规范化业务源码；相同或超过相似度阈值的仓库拒绝交付 | `check_similarity.py` |
 
 ## G7 基础环境自洽（专治「本地能跑、换台机器就炸」）
@@ -33,7 +36,7 @@
 ## G8 真启动怎么算通过
 
 ```bash
-python3 scripts/probe_startup.py --repo <repo> --clean-clone --build
+python3 scripts/probe_startup.py --repo <repo> --clean-clone --profile startup
 ```
 
 `--clean-clone` 不是可选装饰：它先把仓库 `git clone` 到临时目录再跑，因此同时证明了三件事——
@@ -42,11 +45,15 @@ python3 scripts/probe_startup.py --repo <repo> --clean-clone --build
 2. 仓库里没有「未提交但必需」的文件（克隆出来的工作区是干净的）；
 3. 现场装依赖就能起来，不靠任何本地残留。
 
-通过的判据：后端 `/api/health`、`/api/overview` 与业务接口正常；前端首页和入口脚本可加载；
-全栈从前端端口走 `/api/health` 返回 200。随后 Playwright 逐模块真实点击：查询命中、无结果、重置、
-筛选后 CSV 下载与内容解析、完整登记、每个动作后的目标状态、指标变化；纯前端刷新后仍保留登记数据。
-浏览器脚本错误或 `/api` 4xx/5xx 都算失败。`--build` 时 `npm run build` 退出码 0；
-结束时 `cleaned_up: true`（进程全停），临时克隆目录删除，日志复制到源仓库外层 `.probe-logs/`。
+通过的判据：后端 `/api/health` 正常；前端首页有挂载点、入口脚本可加载；
+全栈从前端端口走 `/api/health` 返回健康响应，两个服务均由本次进程组监听。
+纯前端不要求后端/代理。结束时 `cleaned_up: true`（进程全停），临时克隆目录删除，
+日志复制到源仓库外层 `.probe-logs/`。报告 `verification_scope: startup-connectivity`。
+
+按用户约定，整体测试仅一轮，集中修复至多一轮，最后只做上述启动联通。
+不要求修复后浏览器逐模块点击、持久化全回归或生产build；首次测试SHA和最终smoke SHA分别记录。
+显式 `--profile full` 可用于首次整体测试（可加 `--build`），不在最终pipeline默认启用，
+不把“启动联通通过”写成“全业务/E2E/生产构建通过”。
 
 ## G9 跨仓库查重
 
@@ -62,11 +69,11 @@ python3 scripts/check_similarity.py --parent <parent> --repo <repo> --json-out <
 
 ```bash
 python3 scripts/publish_github.py --repo <repo>                     # dry-run
-python3 scripts/publish_github.py --repo <repo> --execute --confirm PUBLISH
+python3 scripts/publish_github.py --repo <repo> --execute
 ```
 
-先决条件与拒绝项：必须是 git 仓库、当前分支是 `main`、工作区干净、静态验收通过；
-还必须有绑定当前 HEAD 的 `probe-report.json`（含浏览器全功能通过且 cleaned_up=true）与
+先决条件与拒绝项：GitHub正式发布需要本仓创建归属凭据与当前真实仓库ID匹配，陌生同名/空仓也不接管；必须是 git 仓库、当前分支是 `main`、工作区干净、静态验收通过；
+还必须有绑定当前 HEAD 的 `probe-report.json`（mode=clean-clone、verification_scope=startup-connectivity、实际依赖安装/前后端启动联通通过且cleaned_up=true）与
 `similarity-report.json`（业务指纹一致）。**远端 `main` 上有本地没有的提交时拒推，脚本不做强推**。
 分支已是最新时报 `up-to-date`，不重复推。推完回读远端 `main` 的 SHA 与本地 HEAD 比对。
 
@@ -150,14 +157,14 @@ token 只以一次性 `git -c http.extraHeader=...` 传参，**不写进 `.git/c
 所以：`每模式上限 3` 时，模式席位 = 12 × 3 = 36；只要主体数 >= 16，
 容量 = min(35, 主体数 × 2, 36) >= 32，稳稳过 30。默认 spec 的实际主体数与容量以每次 verify_repo.py 输出为准。
 
-### 30 条这一条怎么成立
+### 历史静态下限30：仅兼容，不是当前交付依据
 
 容量公式里的模式席位是硬上限：`12 类可用模式 × 每模式上限`。
 
 - 每模式上限 = 2 时，模式席位只有 24，**任何仓库都到不了 30 条**，跟仓库做多大无关；
 - 每模式上限 = 3 时，模式席位 36，此时容量由主体数决定，主体 16 个就够 32 条。
 
-所以「一个仓库最少能出 30 条」这条要求有两个必要条件，缺一不可：
+旧公式要算出30，需要以下两个必要条件；它们不充分，不能据此声明能生成30/35道合格困难题：
 
 1. 仓库侧：主体数 >= 16（以实际派生结果为准）；
 2. 出题侧：每模式上限取 3。**已落地**——2026-09-22 把
@@ -179,7 +186,7 @@ token 只以一次性 `git -c http.extraHeader=...` 传参，**不写进 `.git/c
 
 ### 主体是什么
 
-主体 = 仓库里一个可以被单独改的代码位置，派生规则是冻结的（见 `scripts/repo_rules.py`）：
+旧扫描主体 = 仓库里一个可以被单独改的代码位置，派生规则是冻结的（见 `scripts/repo_rules.py`）：
 
 - 只扫这些路径下的文件：`frontend*/src/**`、`backend/app/**`、`**/src/main/java/**`、
   `**/src/**/*.cpp`、`frontend*/**/*.css` 等（完整列表见 `REPO_SOURCE_PATTERNS`）。
@@ -245,7 +252,7 @@ s11 的分析领域例外会与旧技能形成预期差异；不要把这三项�
 |---|---|---|
 | G1 结构 | 必须有 `backend/`（`app/main.py` 或 `pom.xml` + Controller） | 不要求 `backend/`；必须有 `frontend/src/api/local-service.ts` 与 `frontend/src/data/*.ts` |
 | G6 禁用题型 | 页面 >= 8 **且** 接口文件 >= 8 | 只数页面（>= 8） |
-| G8 真启动 | 后端 `/api/health`、`/api/overview`、业务接口、前端 -> 后端代理链路 | 后端与代理两步记 `skipped: true`（不计失败），前端首页/入口脚本/生产构建照验 |
+| G8 最终启动联通 | 后端 `/api/health`、前端首页/入口脚本、前端 -> 后端代理链路；不做业务接口遍历/E2E/build | 后端与代理记 `skipped: true`（不计失败），只验前端首页/入口脚本；不做E2E/build |
 
 形态判定**不靠「有没有 backend 目录」**，而是读 `frontend/package.json` 的
 `repoKind` 字段（生成时写入 `fullstack` / `frontend-only`）。`verify_repo.py` 与

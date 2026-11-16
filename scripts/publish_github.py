@@ -2,23 +2,24 @@
 """把准备好的仓库推到远端，默认是 GitHub 的 main 分支（其它 git 远端用 --remote-url）。
 
 默认 dry-run：只打印「会建什么仓库、会推哪个提交、会跑哪几条命令」，不碰远端。
-真推要显式加 `--execute --confirm PUBLISH`。
+真推要显式加 `--execute`；--confirm 仅保留旧调用兼容。
 
 推之前会拦这几件事（任一条不过就停，不做强推）：
 
   1. 不是 git 仓库 / 当前分支不是 main / 工作区有未提交改动；
-  2. 静态验收没过（`verify_repo.py`，可用 --skip-verify 跳过）；
+  2. 静态验收没过（`verify_repo.py`，s11正式发布不可跳过）；
   3. 远端 main 上已经有本地没有的提交（分叉）——这种必须人工处理；
-  4. 推完回读远端 SHA，和本地 HEAD 对不上就报错。
+  4. 推完回读远端 SHA，和本地 HEAD 对不上就报错；
+  5. GitHub 同名仓必须有本仓归属记录且匹配真实 ID，空仓也不能接管。
 
 用法：
 
     python3 publish_github.py --repo /path/to/repo                       # 看计划
-    python3 publish_github.py --repo /path/to/repo --execute --confirm PUBLISH
+    python3 publish_github.py --repo /path/to/repo --execute
     python3 publish_github.py --repo /path/to/repo --owner my-org --name my-repo --visibility private \
-        --execute --confirm PUBLISH
+        --execute
     python3 publish_github.py --repo /path/to/repo --remote-url git@gitlab.example.com:group/repo.git \
-        --execute --confirm PUBLISH
+        --execute
 
 token 只以一次性 `git -c http.extraHeader=...` 传参，不写进 .git/config，也不打印。
 """
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -35,6 +37,7 @@ import shlex
 from urllib.parse import urlparse
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -44,13 +47,29 @@ import verify_repo as verifier  # noqa: E402
 import repo_rules as rules  # noqa: E402
 import github_settings
 import check_similarity
+import check_prompt_capacity
 
 DEFAULT_BRANCH = "main"
 
 
+def _redact_github_text(text: str, token: str = "") -> str:
+    for secret in (token, os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_TOKEN")):
+        if secret:
+            text = text.replace(secret, "***")
+    text = re.sub(r"(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+)", "***", text)
+    return re.sub(r"(?i)(authorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?)[^\s,;]+", r"\1***", text)
+
+
 def run(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     env = github_settings.auth_env() if Path(command[0]).name == "gh" else None
-    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, env=env)
+    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, env=env)
+    if env is not None:
+        # Scrub the actual selected credential before it can reach any report,
+        # even when it came from gh's credential store rather than os.environ.
+        token = env.get("GH_TOKEN", "")
+        result.stdout = _redact_github_text(result.stdout, token)
+        result.stderr = _redact_github_text(result.stderr, token)
+    return result
 
 
 def redact(command: list[str]) -> list[str]:
@@ -114,6 +133,137 @@ def remote_head(url: str, branch: str, repo: Path, *, allow_missing: bool = Fals
 
 def repo_exists(full_name: str) -> bool:
     return run([gh_binary(), "repo", "view", full_name]).returncode == 0
+
+
+class OwnershipError(ValueError):
+    """Cannot establish ownership; preserve safe diagnostics, never auto-retry."""
+
+    def __init__(self, message: str, *, github_error: dict | None = None):
+        super().__init__(message)
+        self.github_error = github_error
+
+
+def _github_failure(stage: str, result=None, error: OSError | None = None) -> dict:
+    if result is None:
+        return {"stage": stage, "exit": None, "http_status": None,
+                "diagnostic": _redact_github_text(str(error))[-4000:]}
+    output = _redact_github_text(result.stdout or "").replace("\r\n", "\n")
+    stderr = _redact_github_text(result.stderr or "")
+    headers, separator, body = output.partition("\n\n")
+    # gh repo create may report GraphQL/HTTP errors only on stderr. Retain those
+    # verbatim (redacted), as rate limits are not always an HTTP 429 response.
+    status = re.search(r"\bHTTP(?:/\S+)?\s+(\d{3})\b", output + "\n" + stderr, re.I)
+    selected_headers = "\n".join(line for line in headers.splitlines()
+        if re.match(r"(?:HTTP/|retry-after:|x-ratelimit-[\w-]+:)", line, re.I)) if separator else ""
+    diagnostic = "\n".join(part for part in (selected_headers,
+        (body if separator else output)[-1800:], stderr[-1800:]) if part)
+    return {"stage": stage, "exit": result.returncode,
+            "http_status": int(status.group(1)) if status else None,
+            "diagnostic": diagnostic[-4000:]}
+
+
+def ownership_path(repo: Path) -> Path:
+    """One immutable receipt per resolved local repository, outside its Git tree."""
+    repo = repo.resolve()
+    key = hashlib.sha256(str(repo).encode()).hexdigest()[:24]
+    return repo.parent / f".s11-github-ownership-{key}.json"
+
+
+def github_repo_identity(full_name: str) -> dict | None:
+    """Read GitHub's numeric repository ID. Only an actual HTTP 404 means absent.
+
+    Do not collapse network/auth/CLI failures into a missing repository, and do
+    not infer ownership from an empty remote or a matching name/commit.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", full_name):
+        raise OwnershipError("GitHub owner/name 格式无效")
+    try:
+        result = run([gh_binary(), "api", "--include", f"repos/{full_name}"])
+    except OSError as exc:
+        raise OwnershipError("无法执行 GitHub 身份查询", github_error=_github_failure("identity", error=exc)) from exc
+    headers, separator, body = result.stdout.replace("\r\n", "\n").partition("\n\n")
+    status = re.match(r"HTTP/\S+\s+(\d{3})(?:\s|$)", headers)
+    code = int(status.group(1)) if status else None
+    if result.returncode != 0 and code == 404:
+        return None
+    if result.returncode != 0 or code != 200 or not separator:
+        raise OwnershipError(f"无法读取 GitHub 仓库身份（exit={result.returncode}, HTTP={code}）；安全停止，不尝试接管",
+                             github_error=_github_failure("identity", result))
+    try:
+        payload = json.loads(body)
+        identity = {"id": payload["id"], "owner": payload["owner"]["login"],
+                    "full_name": payload["full_name"]}
+    except (ValueError, TypeError, KeyError) as exc:
+        raise OwnershipError("GitHub 仓库身份响应无效",
+                             github_error=_github_failure("identity", result)) from exc
+    if (type(identity["id"]) is not int or identity["id"] <= 0
+            or not isinstance(identity["owner"], str)
+            or not isinstance(identity["full_name"], str)
+            or identity["full_name"].casefold() != full_name.casefold()
+            or identity["owner"].casefold() != full_name.split("/", 1)[0].casefold()):
+        raise OwnershipError("GitHub 返回的 owner/full_name/id 与请求不符",
+                             github_error=_github_failure("identity", result))
+    return identity
+
+
+def read_ownership(repo: Path) -> dict | None:
+    path = ownership_path(repo)
+    if path.is_symlink():
+        raise OwnershipError(f"归属记录不能是符号链接：{path}")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise OwnershipError(f"无法读取归属记录：{path}") from exc
+    if not isinstance(record, dict):
+        raise OwnershipError(f"归属记录格式无效：{path}")
+    return record
+
+
+def verify_ownership(repo: Path, full_name: str, identity: dict | None) -> dict:
+    record = read_ownership(repo)
+    if record is None:
+        raise OwnershipError(f"同名 GitHub 仓库已存在但缺少本仓归属记录，禁止接管：{ownership_path(repo)}")
+    if identity is None:
+        raise OwnershipError("已有归属证据但 GitHub 仓库不存在/不可见，保留证据，不自动重建或接管")
+    expected_owner = full_name.split("/", 1)[0]
+    if (type(record.get("schema_version")) is not int or record["schema_version"] != 1
+            or record.get("host") != "github.com" or record.get("local_repo") != str(repo.resolve())
+            or type(record.get("id")) is not int or record["id"] != identity["id"]
+            or str(record.get("owner", "")).casefold() != expected_owner.casefold()
+            or str(record.get("full_name", "")).casefold() != full_name.casefold()
+            or identity["full_name"].casefold() != full_name.casefold()
+            or identity["owner"].casefold() != expected_owner.casefold()):
+        raise OwnershipError("归属记录的 local_repo/owner/full_name/id 与真实 GitHub 仓库身份不符，禁止接管")
+    return record
+
+
+def save_ownership(repo: Path, identity: dict, head: str, account: str) -> dict:
+    """Atomically publish a durable, exclusive receipt; never overwrite evidence.
+
+    A same-directory temporary file plus link provides atomic no-clobber
+    publication (unlike replace, which could erase a competing receipt).
+    """
+    path = ownership_path(repo)
+    record = {"schema_version": 1, "host": "github.com", **identity,
+              "local_repo": str(repo.resolve()), "created_head": head, "account": account}
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=repo.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)  # Fails closed if *any* existing receipt appeared.
+        directory = os.open(repo.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        os.unlink(temporary)
+    return record
 
 
 def gh_repo_visibility(full_name: str) -> str | None:
@@ -194,7 +344,7 @@ def configure_origin(repo: Path, url: str, branch: str) -> None:
 
 
 def check_delivery_evidence(repo: Path, head: str) -> dict[str, object]:
-    """s11 仓库发布必须携带绑定当前 HEAD 的查重与全功能验收证据。"""
+    """s11 仓库发布必须携带绑定当前 HEAD 的查重与启动联通证据。"""
     if not ((repo / ".s11-domain.json").is_file() or (repo / ".s11-spec.json").is_file()):
         return {"ok": True, "problems": [], "skipped": "非 s11 生成仓库"}
     problems: list[str] = []
@@ -204,7 +354,7 @@ def check_delivery_evidence(repo: Path, head: str) -> dict[str, object]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            problems.append(f"缺少或无法读取 {path}；先运行完整流水线验收")
+            problems.append(f"缺少或无法读取 {path}；先运行最终启动联通验收与查重")
             continue
         reports[name] = payload
         if payload.get("ok") is not True:
@@ -215,10 +365,29 @@ def check_delivery_evidence(repo: Path, head: str) -> dict[str, object]:
     if isinstance(probe, dict):
         if probe.get("cleaned_up") is not True:
             problems.append("probe-report.json 未证明进程与资源清理完成")
+        if probe.get("mode") != "clean-clone":
+            problems.append("probe-report.json 必须来自干净克隆启动联通验收")
         steps = probe.get("steps") or []
-        if not any(step.get("ok") is True and str(step.get("step", "")).endswith("浏览器全功能验收")
-                   for step in steps if isinstance(step, dict)):
-            problems.append("probe-report.json 缺少浏览器全功能验收通过记录")
+        def passed_step(suffix: str) -> bool:
+            return any(isinstance(step, dict) and step.get("ok") is True
+                       and not step.get("skipped")
+                       and str(step.get("step", "")).endswith(suffix) for step in steps)
+        scope = probe.get("verification_scope")
+        if scope not in ("startup-connectivity", "full-functional"):
+            problems.append("probe-report.json 缺少明确的启动联通验证范围")
+        if any(not isinstance(step, dict) or step.get("ok") is not True for step in steps):
+            problems.append("probe-report.json 存在失败或无效步骤")
+        for suffix in ("前端安装依赖", "前端首页可访问且有挂载点", "前端入口脚本可加载"):
+            if not passed_step(suffix):
+                problems.append(f"probe-report.json 缺少实际完成步骤：{suffix}")
+        if verifier.detect_repo_kind(repo) != "frontend-only":
+            for suffix in ("后端安装依赖", "后端 /api/health 就绪", "前端 -> 后端代理链路通"):
+                if not passed_step(suffix):
+                    problems.append(f"probe-report.json 缺少实际完成步骤：{suffix}")
+        # 全功能证据可兼容，但不能把跳过 E2E 的调试报告冒充 full。
+        # startup 不要求 E2E / build，也不触发额外测试，符合一次测试+一次修复预算。
+        if scope == "full-functional" and not passed_step("浏览器全功能验收"):
+            problems.append("probe-report.json 声称 full-functional 却缺少实际浏览器全功能验收")
     similarity = reports.get("similarity-report.json")
     if isinstance(similarity, dict) and (repo / ".s11-spec.json").is_file():
         try:
@@ -269,10 +438,23 @@ def publish(args) -> dict[str, object]:
         if not result["ok"]:
             problems.append("静态验收没过，先修好再推（或显式 --skip-verify）")
 
+    if args.execute and is_s11:
+        # Re-evaluate the inexpensive capacity gate, never trust a hand-edited pass JSON.
+        # This runs before authentication or any remote write, including --remote-url.
+        capacity = check_prompt_capacity.check_capacity(repo)
+        report["prompt_capacity"] = capacity
+        capacity_ok = capacity.get("ok") is True
+        report["steps"].append({
+            "step": "G10 下游35题位困难容量", "ok": capacity_ok,
+            "detail": "真实下游题位硬闸通过" if capacity_ok else "容量未通过；先增强业务及题位证据",
+        })
+        if not capacity_ok:
+            problems.append("G10 下游困难题位不足或证据无效；不能发布CRUD草稿")
+
     if args.execute:
         evidence = check_delivery_evidence(repo, head)
         report["steps"].append({
-            "step": "当前 HEAD 的查重与全功能验收证据", "ok": evidence["ok"],
+            "step": "当前 HEAD 的查重与启动联通证据", "ok": evidence["ok"],
             "detail": "；".join(evidence["problems"]) or "报告有效",
         })
         problems.extend(evidence["problems"])
@@ -285,7 +467,8 @@ def publish(args) -> dict[str, object]:
     full_name = ""
     remote_ready = True
     if args.remote_url:
-        if urlparse(args.remote_url).hostname == "github.com" or args.remote_url.startswith("git@github.com:"):
+        remote_host = (urlparse(args.remote_url).hostname or "").lower().rstrip(".")
+        if remote_host == "github.com" or re.match(r"(?:[^/@:\s]+@)?github\.com\.?:", args.remote_url, re.I):
             raise SystemExit("GitHub 远端请使用 --owner / --name，--remote-url 仅支持非 GitHub 远端")
         url = args.remote_url
     else:
@@ -297,24 +480,53 @@ def publish(args) -> dict[str, object]:
         name = args.name or repo.name
         full_name = f"{owner}/{name}"
         url = clean_https_url(full_name)
-        exists = repo_exists(full_name)
-        report["remote_exists"] = exists
-        remote_ready = exists
-        if not exists:
-            create_cmd = ["gh", "repo", "create", full_name, f"--{args.visibility}"]
-            if args.description:
-                create_cmd += ["--description", args.description]
-            report["planned_commands"].append(redact(create_cmd))
-            if args.execute:
-                created = run([gh_binary(), "repo", "create", full_name, f"--{args.visibility}"]
-                              + (["--description", args.description] if args.description else []))
-                if created.returncode != 0:
-                    message = created.stderr.strip() or created.stdout.strip() or "gh repo create failed"
-                    raise SystemExit(f"创建仓库 {full_name} 失败：{message}")
-                report["repo_created"] = True
+        # Dry-run retains read-only planning. Real GitHub writes require a
+        # creation receipt for THIS local repo, even when the remote is empty.
+        create_cmd = [gh_binary(), "repo", "create", full_name, f"--{args.visibility}"]
+        if args.description:
+            create_cmd += ["--description", args.description]
+        if args.execute:
+            try:
+                identity = github_repo_identity(full_name)
+                exists = identity is not None
+                report["remote_exists"] = exists
+                report["repo_created"] = False
+                if exists:
+                    verify_ownership(repo, full_name, identity)
+                else:
+                    if read_ownership(repo) is not None:
+                        raise OwnershipError("已有归属记录但远端不存在，保留证据，不自动重建")
+                    report["planned_commands"].append(redact(create_cmd))
+                    try:
+                        created = run(create_cmd)
+                    except OSError as exc:
+                        raise OwnershipError("无法执行 GitHub 建仓命令",
+                            github_error=_github_failure("create", error=exc)) from exc
+                    if created.returncode != 0:
+                        # A concurrent creator is NOT ours. Never retry as an
+                        # existing repository and never manufacture a receipt.
+                        raise OwnershipError("GitHub 创建失败/可能同名竞争冲突；未取得归属，禁止接管",
+                                             github_error=_github_failure("create", created))
+                    report["repo_created"] = True
+                    identity = github_repo_identity(full_name)
+                    if identity is None:
+                        raise OwnershipError("创建后无法回读真实 GitHub 仓库 ID；停止，不推送")
+                    save_ownership(repo, identity, head, selected["account"])
+                    verify_ownership(repo, full_name, identity)
+                report["github_ownership"] = {"path": str(ownership_path(repo)), **identity}
                 remote_ready = True
+            except (OwnershipError, OSError) as exc:
+                report.update(ok=False, problems=[f"GitHub 归属保护：{exc}"])
+                if isinstance(exc, OwnershipError) and exc.github_error is not None:
+                    report["github_error"] = exc.github_error
+                return report
         else:
+            exists = repo_exists(full_name)
+            report["remote_exists"] = exists
             report["repo_created"] = False
+            remote_ready = exists
+            if not exists:
+                report["planned_commands"].append(redact(create_cmd))
 
     report["remote_url"] = url
     report["repo_url"] = f"https://github.com/{full_name}" if full_name else url
@@ -374,6 +586,17 @@ def publish(args) -> dict[str, object]:
         report["next"] = shlex.join(next_cmd)
         return report
 
+    if full_name:
+        # Recheck immediately before the first mutable visibility/origin/push
+        # operation; a deleted/recreated/transferred remote must not slip through.
+        try:
+            verify_ownership(repo, full_name, github_repo_identity(full_name))
+        except (OwnershipError, OSError) as exc:
+            report.update(ok=False, problems=[f"GitHub 归属保护：{exc}"])
+            if isinstance(exc, OwnershipError) and exc.github_error is not None:
+                report["github_error"] = exc.github_error
+            return report
+
     if full_name and remote_ready and report.get("visibility_will_fix"):
         visibility = ensure_visibility(full_name, args.visibility, execute=True)
         report["visibility_after"] = visibility.get("after")
@@ -418,13 +641,10 @@ def main() -> int:
                              "（例如推 skill 自身的代码仓），推生成出来的项目一律不要加")
     parser.add_argument("--allow-dirty", action="store_true", help="允许带未提交改动推送（不建议）")
     parser.add_argument("--execute", action="store_true", help="真的执行；不加就是 dry-run")
-    parser.add_argument("--confirm", help="真执行时必须等于 PUBLISH")
+    parser.add_argument("--confirm", help="兼容旧命令；--execute 已表达执行授权")
     parser.add_argument("--json", action="store_true")
     github_settings.add_arguments(parser)
     args = parser.parse_args()
-
-    if args.execute and args.confirm != "PUBLISH":
-        parser.error("真推需要 --confirm PUBLISH")
 
     report = publish(args)
     if not args.json:
