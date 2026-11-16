@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Read-only, fail-closed admission of *planned* downstream difficult tasks.
 
-Public API: check_capacity(repo, map_path=None, downstream_skill=None, target=35)
+Public API: check_capacity(repo, map_path=None, downstream_skill=None, target=36)
 returns a JSON-serializable report. verify/publish MUST call it afresh with
-target=35 and require report['ok'] is True, not trust an old JSON file or the
+target=36 and require report['ok'] is True, not trust an old JSON file or the
 count alone. Smaller targets are diagnostics only (diagnostic_only=True).
 S11_PROMPT_SKILL overrides the downstream default, including at call time.
 No cache, network, Git writes, prompt generation, or business-source execution
@@ -40,7 +40,7 @@ removal), not a copied lexicon or a self-reported mode. Its other gates are NOT
 claimed passed here. Input is domain_fit.prompt_main_request plus the three
 H1/H2/H3 prompt_excerpts, deduplicated in that order; final prompts don't exist
 at this stage and must be checked separately by downstream. CLI/API ok=True
-for target=1 is diagnostic success, NOT permission to publish 35 tasks.
+for target=1 is diagnostic success, NOT permission to publish 36 tasks.
 """
 from __future__ import annotations
 
@@ -53,6 +53,10 @@ import re
 from pathlib import Path
 import subprocess
 import sys
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import repo_rules as rules
 import tokenize
 from collections import Counter
 from typing import Any
@@ -341,12 +345,12 @@ def _json_process(command: list[str], repo: Path) -> dict:
 
 
 def check_capacity(repo: str | Path, map_path: str | Path | None = None,
-                   downstream_skill: str | Path | None = None, target: int = 35) -> dict:
+                   downstream_skill: str | Path | None = None, target: int = 36) -> dict:
     """Fresh read-only gate for verify/publish; never consumes a previous report.
 
     qualified_plan_count is all-or-nothing for integrity, downstream, mode and
     evidence gates (0 if any fails). A valid 34-task map reports 34 but ok=False
-    for target=35. issues is always a readable list[str]. Unexpected programming
+    for target=36. issues is always a readable list[str]. Unexpected programming
     errors are not converted into success. See module docstring for schemas.
     """
     repo = Path(repo).expanduser().resolve()
@@ -355,8 +359,8 @@ def check_capacity(repo: str | Path, map_path: str | Path | None = None,
     scripts = skill / 'scripts'
     issues: list[str] = []
     report = {'ok': False, 'schema_version': 1, 'repo': str(repo), 'map': str(map_path),
-        'downstream_skill': str(skill), 'target': target, 'publication_target': 35,
-        'diagnostic_only': type(target) is int and target < 35, 'planned_count': 0,
+        'downstream_skill': str(skill), 'target': target, 'publication_target': 36,
+        'diagnostic_only': type(target) is int and target < 36, 'planned_count': 0,
         'qualified_plan_count': 0, 'qualification_policy': 'all-or-nothing-except-target',
         'issues': issues, 'fingerprint': None, 'mode_counts': {},
         'verification_scope': {'final_prompt_quality_verified': False,
@@ -478,6 +482,20 @@ def check_capacity(repo: str | Path, map_path: str | Path | None = None,
             for mode, count in counts.items():
                 if count > 3:
                     issues.append(f'主模式 {mode!r} 共 {count} 题，超过每模式上限 3')
+            if type(target) is int and target >= 36:
+                expected_modes = set(rules.USABLE_MODES)
+                actual_modes = set(counts)
+                missing_modes = sorted(expected_modes - actual_modes)
+                extra_modes = sorted(actual_modes - expected_modes)
+                if missing_modes:
+                    issues.append('正式 36 题缺少可用模式：' + '、'.join(missing_modes))
+                if extra_modes:
+                    issues.append('正式 36 题包含禁用或未知模式：' + '、'.join(extra_modes))
+                for mode in rules.USABLE_MODES:
+                    if counts.get(mode, 0) != 3:
+                        issues.append(
+                            f'正式 36 题要求模式 {mode!r} 恰好 3 条，实际 {counts.get(mode, 0)}'
+                        )
         after = _snapshot(repo, map_path, scripts)
         if before != after:
             issues.append('检查期间 HEAD/工作树/map/下游脚本发生变化，结果作废，请重跑')
@@ -502,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--repo', required=True)
     parser.add_argument('--map', dest='map_path')
     parser.add_argument('--downstream-skill', default=str(_default_downstream()))
-    parser.add_argument('--target', type=int, default=35)
+    parser.add_argument('--target', type=int, default=36)
     parser.add_argument('--json-out', help='可选报告文件；必须在被检查仓库及下游 skill 之外')
     args = parser.parse_args(argv)
     result = check_capacity(args.repo, args.map_path, args.downstream_skill, args.target)

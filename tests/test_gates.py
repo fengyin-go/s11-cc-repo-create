@@ -101,13 +101,20 @@ class ScaffoldAndVerify(unittest.TestCase):
             "test_publish_refuses_diverged_remote",
         }:
             capacity = patch.object(publisher.check_prompt_capacity, "check_capacity",
-                                    return_value={"ok": True, "qualified_plan_count": 35})
+                                    return_value={"ok": True, "qualified_plan_count": 36})
             capacity.start()
             self.addCleanup(capacity.stop)
+            opportunity = patch.object(
+                publisher.build_prompt_opportunities,
+                "validate_existing",
+                return_value={"ok": True, "selected_count": 36, "reserve_count": 12},
+            )
+            opportunity.start()
+            self.addCleanup(opportunity.stop)
 
     def verify(self, repo: Path | None = None, **kwargs) -> dict:
         return verifier.verify(repo or self.repo, min_lines=kwargs.pop("min_lines", 2000),
-                               min_capacity=kwargs.pop("min_capacity", 30),
+                               min_capacity=kwargs.pop("min_capacity", rules.MIN_CAPACITY),
                                per_mode=kwargs.pop("per_mode", rules.MAX_PER_MODE),
                                per_subject=kwargs.pop("per_subject", rules.MAX_PER_SUBJECT))
 
@@ -115,7 +122,7 @@ class ScaffoldAndVerify(unittest.TestCase):
         result = self.verify()
         self.assertTrue(result["ok"], msg=result["failures"])
         self.assertGreaterEqual(result["checks"]["code_size"]["code_lines"], 2000)
-        self.assertGreaterEqual(result["checks"]["capacity"]["capacity"], 30)
+        self.assertGreaterEqual(result["checks"]["capacity"]["capacity"], rules.MIN_CAPACITY)
         self.assertEqual(result["checks"]["structure"]["frontend_stack"], "vue")
         self.assertEqual(result["checks"]["structure"]["backend_stack"], "python")
 
@@ -126,8 +133,8 @@ class ScaffoldAndVerify(unittest.TestCase):
                        len(subjects) * rules.MAX_PER_SUBJECT,
                        len(rules.USABLE_MODES) * rules.MAX_PER_MODE)
         self.assertEqual(capacity["capacity"], expected)
-        self.assertGreaterEqual(len(subjects), 16,
-                                "主体数少于 16 时容量撑不到 30 条")
+        self.assertGreaterEqual(len(subjects), 18,
+                                "主体数少于 18 时容量撑不到 36 条")
 
     def test_rule_snapshot_matches_generated_repo_derivation(self):
         """同一批源码，主体派生必须是稳定的；改规则会立刻在这里暴露。"""
@@ -155,7 +162,8 @@ class ScaffoldAndVerify(unittest.TestCase):
         self.assertFalse(result["checks"]["gitignore"]["ok"])
 
     def test_code_size_gate_rejects_when_minimum_is_not_met(self):
-        result = verifier.verify(self.repo, min_lines=999999, min_capacity=30, per_mode=3, per_subject=2)
+        result = verifier.verify(self.repo, min_lines=999999, min_capacity=rules.MIN_CAPACITY,
+                                 per_mode=3, per_subject=2)
         self.assertFalse(result["ok"])
         self.assertTrue(any("G4 代码量不足" in failure for failure in result["failures"]))
 
@@ -165,22 +173,22 @@ class ScaffoldAndVerify(unittest.TestCase):
         small_spec = self.tmp / "small-spec.json"
         small_spec.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
         target = self.tmp / "small"
-        with self.assertRaisesRegex(AssertionError, "至少包含 16 个模块"):
+        with self.assertRaisesRegex(AssertionError, "至少包含 18 个模块"):
             generate(target, "--spec", str(small_spec))
         self.assertFalse(target.exists())
 
     def test_capacity_gate_rejects_few_subjects(self):
-        """主体不够时容量必然够不到 30 条，闸门要拦下。"""
+        """主体不够时容量必然够不到 36 条，闸门要拦下。"""
         target = self.tmp / "thin"
         (target / "frontend" / "src" / "views" / "alpha").mkdir(parents=True)
         (target / "frontend" / "src" / "views" / "beta").mkdir(parents=True)
         for name in ("alpha", "beta"):
             (target / "frontend" / "src" / "views" / name / "index.vue").write_text(
                 "<template><div>工单列表</div></template>\n", encoding="utf-8")
-        result = verifier.check_capacity(target, min_capacity=30, per_mode=rules.MAX_PER_MODE,
+        result = verifier.check_capacity(target, min_capacity=rules.MIN_CAPACITY, per_mode=rules.MAX_PER_MODE,
                                          per_subject=rules.MAX_PER_SUBJECT)
         self.assertFalse(result["ok"])
-        self.assertLess(result["capacity"], 30)
+        self.assertLess(result["capacity"], rules.MIN_CAPACITY)
 
     def test_hardcoded_secret_is_rejected(self):
         copy = self.tmp / "secret"

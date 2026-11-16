@@ -49,7 +49,7 @@ class CapacityFixture:
         self.commit('source S')
         self.base = self.git('rev-parse', 'HEAD').strip()
         self.map_path = self.repo / '.s11-capacity/repo-topic-map.json'
-        self.payload = self.make_map(35)
+        self.payload = self.make_map(36)
         self.save_map()
         self.head = self.git('rev-parse', 'HEAD').strip()
 
@@ -114,7 +114,8 @@ class CapacityFixture:
                 'version': 1, 'profile': 'gsb-semantic-v2', 'base_commit': self.base}
 
     def modes_result(self):
-        records = [{'sequence': p['sequence'], 'mode': f'mode-{i // 3}'}
+        modes = list(capacity.rules.USABLE_MODES)
+        records = [{'sequence': p['sequence'], 'mode': modes[i // 3]}
                    for i, p in enumerate(self.payload['task_plan'])]
         counts = dict(capacity.Counter(p['mode'] for p in records))
         return {'items': records, 'mode_counts': counts, 'checked_count': len(records), 'gate_version': 'mock'}
@@ -180,14 +181,14 @@ class CapacityTest(CapacityFixture, unittest.TestCase):
         self.assertTrue(report['diagnostic_only'])
         self.assertEqual(report['qualified_plan_count'], 1)
         with self.mocks():
-            self.rejected(self.check(target=35), 'target=35')
+            self.rejected(self.check(target=36), 'target=36')
 
     def test_public_default_api_and_defaults(self):
         with self.mocks(), patch.object(capacity, 'DEFAULT_DOWNSTREAM', self.downstream), \
              patch.dict(os.environ, {'S11_PROMPT_SKILL': ''}):
             report = capacity.check_capacity(self.repo)
         self.assertTrue(report['ok'], report['issues'])
-        self.assertEqual(report['qualified_plan_count'], 35)
+        self.assertEqual(report['qualified_plan_count'], 36)
         self.assertEqual(report['source_head'], self.head)
         self.assertEqual(report['source_base_commit'], self.base)
         self.assertEqual(report['fingerprint']['head'], self.head)
@@ -317,14 +318,14 @@ class CapacityTest(CapacityFixture, unittest.TestCase):
         with self.mocks():
             self.rejected(self.check(), 'assume-unchanged')
 
-    def test_less_than_default_35_is_not_theoretical_capacity(self):
+    def test_less_than_default_36_is_not_theoretical_capacity(self):
         self.payload = self.make_map(34)
         self.payload['max_capacity'] = 99999
         self.save_map()
         with self.mocks():
             report = self.check()
-        self.rejected(report, 'target=35')
-        self.assertEqual(report['qualified_plan_count'], 34)
+        self.rejected(report, 'target=36')
+        self.assertEqual(report['qualified_plan_count'], 0)
 
     def test_custom_target_and_invalid_targets(self):
         self.payload = self.make_map(2)
@@ -333,8 +334,8 @@ class CapacityTest(CapacityFixture, unittest.TestCase):
             diagnostic = self.check(target=2)
             self.assertTrue(diagnostic['ok'])
             self.assertTrue(diagnostic['diagnostic_only'])
-            self.assertEqual(diagnostic['publication_target'], 35)
-        for invalid in (0, -1, True, '35'):
+            self.assertEqual(diagnostic['publication_target'], 36)
+        for invalid in (0, -1, True, '36'):
             with self.subTest(target=invalid), self.mocks():
                 self.rejected(self.check(target=invalid), 'target')
 
@@ -376,8 +377,8 @@ class CapacityTest(CapacityFixture, unittest.TestCase):
         self.assertEqual(report['qualified_plan_count'], 0)
 
     def test_downstream_ok_false_or_bad_count_is_rejected(self):
-        for value in ({'ok': False, 'task_plan_count': 35}, {'ok': True, 'task_plan_count': 34},
-                      {'ok': True, 'task_plan_count': '35'}, {'task_plan_count': 35}):
+        for value in ({'ok': False, 'task_plan_count': 36}, {'ok': True, 'task_plan_count': 34},
+                      {'ok': True, 'task_plan_count': '36'}, {'task_plan_count': 36}):
             with self.subTest(value=value), self.mocks(side_effect=[value]):
                 self.rejected(self.check(), '下游未明确成功')
 
@@ -386,7 +387,7 @@ class CapacityTest(CapacityFixture, unittest.TestCase):
             value = self.modes_result()
             for record in value['items']:
                 record['mode'] = mode
-            value['mode_counts'] = {mode: 35} if mode else {}
+            value['mode_counts'] = {mode: 36} if mode else {}
             self.payload['task_plan'][0]['mode'] = 'self-reported-distinct-mode'
             self.save_map()
             with self.subTest(mode=mode), self.mocks(side_effect=[self.validator_result(), value]):

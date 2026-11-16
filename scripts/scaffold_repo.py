@@ -9,7 +9,7 @@
   3. 仓库根目录有 .gitignore，覆盖依赖、缓存、构建产物、日志、环境文件等。
   4. 源码总行数 >= 2000 行（不含依赖目录、构建产物、锁文件）。
   5. 不含禁用题型（代码理解），业务代码落在扫描模式覆盖的路径里。
-  6. 主体数与需求模式数算出来的容量 >= 30（见 references/hard-rules.md）。
+  6. 主体数与需求模式数算出来的容量 >= 36（见 references/hard-rules.md）。
   7. **题域不能命中 0731 严禁出题清单**（命中即废题）。这条在生成之前就拦：
      spec 的应用名 / 描述 / 模块名 / 业务字段 / 状态 / 动作里出现禁用词就直接拒绝生成，
      没有绕过参数。命中即换题域，别改措辞绕。
@@ -48,6 +48,7 @@ import github_settings
 import domain_rules
 
 DEFAULT_SPEC_NAME = "spec-data-engineering.json"
+MIN_SPEC_MODULES = 18
 
 # 项目编号：<前缀 2~4 个字母><5 位数>，5 位数首位固定是 1（10001–19999），例如 cc10001。
 PROJECT_ID_RE = re.compile(r"^([A-Za-z]{2,4})(1\d{4})$")
@@ -288,8 +289,11 @@ def normalize_spec(raw_spec: dict, frontend: str | None = None, backend: str | N
         raise SystemExit("全栈仓库的前后端端口不能相同")
 
     modules = spec.get("modules")
-    if not isinstance(modules, list) or len(modules) < 16:
-        raise SystemExit("spec.modules 必须至少包含 16 个模块，才能满足容量下限")
+    if not isinstance(modules, list) or len(modules) < MIN_SPEC_MODULES:
+        raise SystemExit(
+            f"spec.modules 必须至少包含 {MIN_SPEC_MODULES} 个模块，"
+            "才能为 36 个正式题位和同模式备用卡留下空间"
+        )
     seen: set[str] = set()
     seen_classes: set[str] = set()
     normalized_modules = []

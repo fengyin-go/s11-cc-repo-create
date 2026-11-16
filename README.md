@@ -1,8 +1,9 @@
 # s11-cc-repo-create
 
-为solo11生成数据工程底座，随后交给 `s11-gsb-prompt-create`。2026-11-16起以**至少35个通过当前下游H1/H2/H3 v2的题位**为交付下限；旧源码行数、主体数和CRUD脚手架只做草稿检查。
+为 solo11 生成数据工程底座，随后交给 `s11-gsb-prompt-create`。2026-11-16 起以 **36 个通过当前下游 H1/H2/H3 v2 的题位**为交付下限；旧源码行数、主体数和 CRUD 脚手架只做草稿检查。
 
-- **容量优先**：约42个原始候选→源码/领域/类型/困难/主题审计→至少35个合格题位；不编造缺陷、不放宽闸门。
+- **容量优先**：12个可用模式各3条；36张正式机会卡+12张备用卡→源码/领域/类型/困难/主题审计→至少36个合格题位；不编造缺陷、不放宽闸门。
+- **提示词机会地图**：机会卡写到生成仓库外，记录业务故事、数据链、冲突轴、锚点和自然切入角度，不保存最终题面。
 - **无人值守**：自主选型、修复、清理本批拥有的生成产物和执行获授权的新仓发布；不二次询问PUBLISH，不接管既有项目/陌生远端。
 - **双层并行**：多agent分仓实现，流水线 `--jobs` + `--probe-jobs` + `--publish-jobs` 分资源并行。
 - **固定验证预算**：整体测试一轮→集中修复至多一轮→最终只验前后端启动/代理联通；不再补跑全量E2E和生产构建。支持prepared仓恢复、下载缓存、发布步骤单独重试和阶段计时。
@@ -19,6 +20,9 @@ agent增强真实业务并提交题位材料后：
 
 ```bash
 python3 scripts/check_prompt_capacity.py --repo /path/to/repo
+python3 scripts/build_prompt_opportunities.py --repo /path/to/repo \
+  --briefs /path/to/prompt-opportunity-briefs.json \
+  --out /path/to/parent/prompt-opportunities/repo-name.json
 python3 scripts/run_pipeline.py --parent /path/to/parent \
   --prepared-repo /path/to/repo --jobs 4 --probe-jobs 2 --publish-jobs 1 --publish
 ```

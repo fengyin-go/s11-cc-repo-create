@@ -39,6 +39,31 @@ class PublicationCapacityTests(unittest.TestCase):
             origin.assert_not_called()
             remote.assert_not_called()
 
+    def test_s11_publication_requires_external_opportunity_map_before_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            (repo / ".s11-domain.json").write_text('{"domain":"数据工程"}')
+            args = argparse.Namespace(
+                repo=str(repo), branch="main", execute=True, allow_dirty=False,
+                skip_verify=False, remote_url="unused", opportunity_map=None,
+            )
+            capacity = {"ok": True, "fingerprint": {"sha256": "capacity"}}
+            with patch.object(publisher, "local_head", return_value="a" * 40), \
+                 patch.object(publisher, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                 patch.object(publisher.verifier, "verify", return_value={"ok": True}), \
+                 patch.object(publisher.check_prompt_capacity, "check_capacity", return_value=capacity), \
+                 patch.object(publisher, "check_delivery_evidence", return_value={"ok": True, "problems": []}), \
+                 patch.object(publisher, "configure_origin") as origin, \
+                 patch.object(publisher, "repo_exists") as remote:
+                result = publisher.publish(args)
+            self.assertFalse(result["ok"])
+            self.assertTrue(any("机会地图" in item for item in result["problems"]))
+            self.assertFalse(result["prompt_opportunities"]["ok"])
+            origin.assert_not_called()
+            remote.assert_not_called()
+
     def test_publication_accepts_smoke_without_e2e_build_but_requires_connectivity(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"

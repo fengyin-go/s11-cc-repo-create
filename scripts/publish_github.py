@@ -8,9 +8,10 @@
 
   1. 不是 git 仓库 / 当前分支不是 main / 工作区有未提交改动；
   2. 静态验收没过（`verify_repo.py`，s11正式发布不可跳过）；
-  3. 远端 main 上已经有本地没有的提交（分叉）——这种必须人工处理；
-  4. 推完回读远端 SHA，和本地 HEAD 对不上就报错；
-  5. GitHub 同名仓必须有本仓归属记录且匹配真实 ID，空仓也不能接管。
+  3. s11 仓库缺少当前 HEAD 的 36 题位容量结果或仓库外 36+12 机会地图；
+  4. 远端 main 上已经有本地没有的提交（分叉）——这种必须人工处理；
+  5. 推完回读远端 SHA，和本地 HEAD 对不上就报错；
+  6. GitHub 同名仓必须有本仓归属记录且匹配真实 ID，空仓也不能接管。
 
 用法：
 
@@ -48,6 +49,7 @@ import repo_rules as rules  # noqa: E402
 import github_settings
 import check_similarity
 import check_prompt_capacity
+import build_prompt_opportunities
 
 DEFAULT_BRANCH = "main"
 
@@ -445,11 +447,34 @@ def publish(args) -> dict[str, object]:
         report["prompt_capacity"] = capacity
         capacity_ok = capacity.get("ok") is True
         report["steps"].append({
-            "step": "G10 下游35题位困难容量", "ok": capacity_ok,
+            "step": "G10 下游36题位困难容量", "ok": capacity_ok,
             "detail": "真实下游题位硬闸通过" if capacity_ok else "容量未通过；先增强业务及题位证据",
         })
         if not capacity_ok:
             problems.append("G10 下游困难题位不足或证据无效；不能发布CRUD草稿")
+        opportunity_path = Path(
+            getattr(args, "opportunity_map", None)
+            or repo.parent / "prompt-opportunities" / f"{repo.name}.json"
+        ).expanduser().resolve()
+        opportunity = build_prompt_opportunities.validate_existing(
+            repo,
+            opportunity_path,
+            capacity=capacity,
+            expected_head=head,
+        )
+        report["prompt_opportunities"] = opportunity
+        report["steps"].append({
+            "step": "仓库外提示词机会地图",
+            "ok": opportunity.get("ok") is True,
+            "detail": (
+                f"通过：{opportunity.get('selected_count')} 正式 + "
+                f"{opportunity.get('reserve_count')} 备用，绑定 HEAD {head[:12]}"
+                if opportunity.get("ok") is True
+                else "；".join(opportunity.get("issues") or [])[:500]
+            ),
+        })
+        if opportunity.get("ok") is not True:
+            problems.append("提示词机会地图缺失、被替换或与当前仓库不一致；不能发布")
 
     if args.execute:
         evidence = check_delivery_evidence(repo, head)
@@ -636,6 +661,10 @@ def main() -> int:
                              "下游容器要能匿名 clone；发现远端是 private 会自动改成 public 并记录")
     parser.add_argument("--description", help="仓库描述")
     parser.add_argument("--remote-url", help="非 GitHub 远端（例如 GitLab / 本地裸仓库）：跳过 gh 建仓直接推")
+    parser.add_argument(
+        "--opportunity-map",
+        help="仓库外提示词机会地图；默认 <repo父目录>/prompt-opportunities/<repo名>.json",
+    )
     parser.add_argument("--skip-verify", action="store_true",
                         help="跳过静态验收。只有推「不是本 skill 生成的项目」的仓库时才用"
                              "（例如推 skill 自身的代码仓），推生成出来的项目一律不要加")

@@ -5,7 +5,7 @@
 --keep-going 继续派发剩余 spec。--publish 即授权发布，无须重复确认。
 不自动重试整条链路：失败报告保留现场，并给出失败子步骤的重试命令。
 --spec 是草稿模式，不默认声称 ready。增强后用 --prepared-repo 复用现有仓库，
-跳过生成并强制执行 35 难题容量门禁；所有发布也必须完成该门禁。
+跳过生成并强制执行 36 难题容量门禁；所有发布也必须完成该门禁。
 最终真启动只跑 startup profile，不补跑浏览器E2E或生产构建。
 首次整体测试与至多一次集中修复由主控agent执行并记录；本脚本不自动测试/修复循环。
 
@@ -41,6 +41,7 @@ PROBE = SCRIPT_DIR / "probe_startup.py"
 SIMILARITY = SCRIPT_DIR / "check_similarity.py"
 PUBLISH = SCRIPT_DIR / "publish_github.py"
 CAPACITY = SCRIPT_DIR / "check_prompt_capacity.py"
+OPPORTUNITIES = SCRIPT_DIR / "build_prompt_opportunities.py"
 SPEC_FILE = ".s11-spec.json"
 
 
@@ -136,7 +137,7 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
             log(name, "开始")
             try:
                 if required_file is not None and not required_file.is_file():
-                    raise StepFailed(name, f"缺少容量题位图：{required_file}；请先增强实际数据链路并撰写 topic map")
+                    raise StepFailed(name, f"缺少本步骤必需文件：{required_file}")
                 yield _run(name, cmd)
                 record["steps"][name] = True
             finally:
@@ -205,7 +206,7 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
                     json.dumps(similarity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             log("跨仓库查重", f"通过（历史 {similarity.get('history_count')} 个）")
 
-        # 静态 CRUD 检查不代表足够支撑 35 道难题。prepared 验收及任何发布都强制过此门禁。
+        # 静态 CRUD 检查不代表足够支撑 36 道难题。prepared 验收及任何发布都强制过此门禁。
         if prepared or args.publish:
             capacity_cmd = [sys.executable, str(CAPACITY), "--repo", str(repo_root),
                             "--json-out", str(Path(container) / "prompt-capacity-report.json")]
@@ -213,10 +214,34 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
                        required_file=repo_root / ".s11-capacity" / "repo-topic-map.json") as capacity_report:
                 record["prompt_capacity"] = capacity_report
                 record["capacity_validated"] = True
-                log("出题容量验收", "通过（独立容量门禁，target 默认 35）")
+                log("出题容量验收", "通过（独立容量门禁，target 默认 36）")
+            briefs_path = Path(container) / "prompt-opportunity-briefs.json"
+            opportunities_path = (
+                Path(args.parent) / "prompt-opportunities" / f"{repo_root.name}.json"
+            )
+            opportunity_cmd = [
+                sys.executable,
+                str(OPPORTUNITIES),
+                "--repo",
+                str(repo_root),
+                "--briefs",
+                str(briefs_path),
+                "--out",
+                str(opportunities_path),
+            ]
+            with stage("提示词机会地图", opportunity_cmd, limits.probe,
+                       required_file=briefs_path) as opportunity_report:
+                record["prompt_opportunities"] = opportunity_report
+                record["prompt_opportunities_validated"] = True
+                log(
+                    "提示词机会地图",
+                    f"通过（{opportunity_report.get('selected_count')} 正式 + "
+                    f"{opportunity_report.get('reserve_count')} 备用）",
+                )
         else:
             record["capacity_validated"] = False
             skipped("出题容量验收", "--spec 仅生成并检查草稿；增强数据链路和 topic map 后使用 --prepared-repo")
+            skipped("提示词机会地图", "草稿模式不生成；完成真实业务和容量 map 后使用 --prepared-repo")
 
         if args.skip_probe:
             skipped("真启动验收", "已按 --skip-probe 跳过")
@@ -245,7 +270,8 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
             skipped("推送 GitHub", "未加 --publish，只做本地预演")
         else:
             publish_cmd = [sys.executable, str(PUBLISH), "--repo", str(repo_root),
-                           "--visibility", args.visibility, "--json", "--execute", "--confirm", "PUBLISH"]
+                           "--visibility", args.visibility, "--json", "--execute", "--confirm", "PUBLISH",
+                           "--opportunity-map", str(opportunities_path)]
             # 保留发布子脚本现有协议；授权已由顶层 --publish 明确给出。
             if args.owner:
                 publish_cmd += ["--owner", args.owner]
@@ -262,7 +288,11 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
                     raise StepFailed("推送 GitHub", f"仓库可见性不是要求的 {args.visibility}")
                 log("推送 GitHub", f"{record.get('repo_url')} 可见性 {record.get('visibility_after')} 远端=本地 True")
         record["ok"] = True
-        record["ready"] = bool(record.get("capacity_validated") and record["steps"].get("真启动验收") is True)
+        record["ready"] = bool(
+            record.get("capacity_validated")
+            and record.get("prompt_opportunities_validated")
+            and record["steps"].get("真启动验收") is True
+        )
     except (Exception, SystemExit) as exc:
         record.update({
             "ok": False, "failed_step": active_step,

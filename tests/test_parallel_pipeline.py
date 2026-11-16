@@ -44,6 +44,7 @@ class MockChildren:
         step = {
             "scaffold_repo.py": "生成", "verify_repo.py": "静态验收",
             "probe_startup.py": "真启动验收", "check_prompt_capacity.py": "出题容量验收",
+            "build_prompt_opportunities.py": "提示词机会地图",
             "publish_github.py": "推送 GitHub", "check_similarity.py": "跨仓库查重",
         }[script]  # Any unexpected command fails instead of leaking a real subprocess.
         if "--record" in cmd:
@@ -78,6 +79,8 @@ class MockChildren:
                 if self.maps:
                     (root / ".s11-capacity").mkdir()
                     (root / ".s11-capacity/repo-topic-map.json").write_text('{"topics": ["mock"]}')
+                (root.parent / "prompt-opportunity-briefs.json").write_text(
+                    '{"opportunities": []}', encoding="utf-8")
                 project["container"] = str(root.parent)
                 payload = {"ok": True, "project": project, "repo_root": str(root),
                            "app_name": spec["app_name"], "kind": "fullstack", "modules": 5,
@@ -88,7 +91,10 @@ class MockChildren:
             elif step == "真启动验收":
                 payload = {"ok": True, "cleaned_up": True, "source_head": "abc"}
             elif step == "出题容量验收":
-                payload = {"ok": True, "target": 35, "capacity": 35}
+                payload = {"ok": True, "target": 36, "capacity": 36}
+            elif step == "提示词机会地图":
+                payload = {"ok": True, "selected_count": 36, "reserve_count": 12,
+                           "sha256": "mock-opportunities"}
             elif step == "推送 GitHub":
                 payload = {"ok": True, "commit": "abc", "remote_head_after": "abc", "pushed": True,
                            "repo_url": "mock-owner/mock-repo", "visibility_after": "public"}
@@ -159,6 +165,8 @@ class ParallelPipelineTests(unittest.TestCase):
         if has_map:
             (root / ".s11-capacity").mkdir()
             (root / ".s11-capacity/repo-topic-map.json").write_text('{"topics": ["mock"]}')
+        (root.parent / "prompt-opportunity-briefs.json").write_text(
+            '{"opportunities": []}', encoding="utf-8")
         return root
 
     def args(self, **overrides):
@@ -534,7 +542,7 @@ class ParallelPipelineTests(unittest.TestCase):
                  subprocess.CompletedProcess([], 0, "not JSON", ""),
                  subprocess.CompletedProcess([], 1, '{"ok":true}', ""),
                  subprocess.CompletedProcess([], 0, '{"ok":false,"steps":{"x":false}}', ""),
-                 subprocess.CompletedProcess([], 0, '{"capacity":35}', ""),
+                 subprocess.CompletedProcess([], 0, '{"capacity":36}', ""),
                  subprocess.CompletedProcess([], 0, '{"ok":"true"}', "")]
         for result in cases:
             kwargs = {"side_effect": result} if isinstance(result, BaseException) else {"return_value": result}
@@ -546,7 +554,7 @@ class ParallelPipelineTests(unittest.TestCase):
 
     def test_capacity_issues_survive_summary_and_keep_going_checks_all_prepared(self):
         repos = [self.prepared(1), self.prepared(2)]
-        self.children.responses["出题容量验收"] = {"ok": False, "issues": ["qualified_plan_count below target 35"]}
+        self.children.responses["出题容量验收"] = {"ok": False, "issues": ["qualified_plan_count below target 36"]}
         code, report = self.cli("--prepared-repo", repos[0], "--prepared-repo", repos[1],
                                 "--publish", "--keep-going", "--jobs", 1)
         self.assertEqual(code, 1)

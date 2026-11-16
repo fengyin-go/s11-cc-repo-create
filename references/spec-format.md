@@ -48,7 +48,7 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 | `backend` | | `python`（默认，FastAPI）、`java`（Spring Boot 17），或 `none`（**纯前端仓库**，不生成后端）；可被 `--backend` 覆盖 |
 | `port_frontend` | | 前端端口，默认 5173 |
 | `port_backend` | | 后端端口，默认 8000（`backend: none` 时不使用） |
-| `modules` | ✓ | 业务模块数组，脚手架兼容下限16个；只能保证旧扫描公式下限，不能保证35道困难题。新仓按真实业务设计约20～24个topic并通过容量契约 |
+| `modules` | ✓ | 业务模块数组，新仓下限 18 个；只能保证结构空间，不能保证 36 道困难题。按真实业务设计约 20～24 个 topic 并通过容量契约 |
 
 ## 模块字段
 
@@ -78,9 +78,9 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 | `metrics` | | 如填写必须正好 3 项；数值由当前数据动态计算，不再是固定常量 |
 | `desc` | | 覆盖自动生成的页面说明 |
 
-## 怎么设计能产35道困难题的底座
+## 怎么设计能产 36 道困难题的底座
 
-至少16模块只是历史草稿兼容约束；不要只填写更多CRUD字段就宣称容量成立。按 [capacity-design.md](capacity-design.md) 设计约20～24个真实topic和贯通数据流，准备约42个原始候选，实际实现业务后保留至少35个合格H1/H2/H3 v2题位。
+18 个模块是数学下限，不要只填写更多 CRUD 字段就宣称容量成立。按 [capacity-design.md](capacity-design.md) 设计约 20～24 个真实 topic 和贯通数据流，准备 36 张正式机会卡和 12 张同模式备用卡，实际实现业务后保留至少 36 个合格 H1/H2/H3 v2 题位。提示词机会地图写在生成仓库外，格式见 [prompt-opportunities.md](prompt-opportunities.md)。
 
 字段/状态/动作使用具体数据语义；既要区分业务对象，也要形成真正的跨模块数据消费。独立页面、文件数、动作按钮数均不是困难题容量证据。请先设计真实输入、加工产物与消费者，再选择CRUD、DAG、时间线等展示形态；不能反过来用展示形态证明真实数据链路。
 
