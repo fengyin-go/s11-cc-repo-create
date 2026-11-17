@@ -372,6 +372,7 @@ def discover_business_endpoints(backend_dir: Path | None) -> list[str]:
     模块对应的接口，保证老仓库的行为不变。
     """
     found: list[str] = []
+    generic = False
     if backend_dir:
         routers = backend_dir / "app" / "routers"
         if routers.is_dir():
@@ -379,6 +380,8 @@ def discover_business_endpoints(backend_dir: Path | None) -> list[str]:
                 if path.stem == "__init__":
                     continue
                 text = path.read_text(encoding="utf-8", errors="replace")
+                if '@router.get("/{module}"' in text:
+                    generic = True
                 for match in re.findall(r"prefix\s*=\s*[\"']([^\"']+)[\"']", text):
                     if match not in found:
                         found.append(match)
@@ -386,9 +389,20 @@ def discover_business_endpoints(backend_dir: Path | None) -> list[str]:
         if java_root.is_dir():
             for path in sorted(java_root.rglob("*.java")):
                 text = path.read_text(encoding="utf-8", errors="replace")
+                if '@RequestMapping("/api/{module}")' in text:
+                    generic = True
                 for match in re.findall(r"@RequestMapping\(\s*[\"']([^\"']+)[\"']", text):
                     if match not in found:
                         found.append(match)
+    if generic and backend_dir:
+        spec_path = backend_dir.parent / ".s11-spec.json"
+        try:
+            modules = json.loads(spec_path.read_text(encoding="utf-8")).get("modules") or []
+            concrete = [f"/api/{item['key']}" for item in modules if item.get("key")]
+            if concrete:
+                return sorted(concrete)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     fallback_key = default_spec_module_key()
     return found or [f"/api/{fallback_key}" if fallback_key else "/api/health"]
 

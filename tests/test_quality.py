@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,8 @@ sys.path.insert(0, str(SKILL / "scripts"))
 import check_similarity
 import publish_github
 import scaffold_repo
+import topic_map_v3
+import verify_repo as verifier
 
 
 class QualityGatesTest(unittest.TestCase):
@@ -86,25 +89,55 @@ class QualityGatesTest(unittest.TestCase):
         result = check_similarity.evaluate(changed, [{"spec": self.spec, "project_id": "old"}])
         self.assertTrue(result["ok"], result)
 
-    def test_generated_contract_and_e2e_assets_exist_for_all_python_and_local_forms(self):
+    def test_generated_compact_contract_exists_for_all_python_and_local_forms(self):
         forms = (("vue", "python"), ("react", "python"), ("vue", "none"), ("react", "none"))
         for frontend, backend in forms:
             with self.subTest(frontend=frontend, backend=backend):
                 repo = self.root / f"{frontend}-{backend}"
                 scaffold_repo.scaffold(scaffold_repo.normalize_spec(self.spec, frontend, backend), repo)
-                self.assertTrue((repo / "frontend/tests/functionality.spec.ts").is_file())
-                self.assertTrue((repo / "frontend/playwright.config.ts").is_file())
+                workbench = (
+                    repo / "frontend/src/views/WorkbenchView.vue"
+                    if frontend == "vue" else repo / "frontend/src/views/WorkbenchView.tsx"
+                )
+                self.assertTrue(workbench.is_file())
+                self.assertFalse((repo / "frontend/tests/functionality.spec.ts").exists())
+                self.assertFalse((repo / "frontend/playwright.config.ts").exists())
                 all_text = "\n".join(path.read_text(encoding="utf-8") for path in repo.rglob("*")
                                      if path.is_file() and path.suffix in {".vue", ".tsx", ".ts", ".py"})
                 self.assertNotIn("尚未接入审批流", all_text)
                 self.assertIn("data-testid=", all_text)
                 if backend == "python":
-                    router = (repo / "backend/app/routers/datasource.py").read_text(encoding="utf-8")
-                    self.assertLess(router.index('@router.get("/export")'), router.index('@router.get("/{entry_id}"'))
+                    router = (repo / "backend/app/routers/resource.py").read_text(encoding="utf-8")
+                    self.assertLess(router.index('@router.get("/{module}/export"'),
+                                    router.index('@router.get("/{module}/{entry_id}"'))
                     self.assertIn("payload: ActionPayload", router)
-                    self.assertIn("filters=query_filters(request)", router)
+                    self.assertTrue((repo / "backend/app/services/datasource.py").is_file())
                 else:
                     self.assertIn("export function createEntry", (repo / "frontend/src/api/local-service.ts").read_text())
+                    self.assertTrue((repo / "frontend/src/domain/datasource.ts").is_file())
+
+    def test_compact_layout_has_size_budget_and_no_capacity_metadata_in_repo(self):
+        repo = self.root / "compact-budget"
+        scaffold_repo.scaffold(
+            scaffold_repo.normalize_spec(self.spec, "vue", "python"), repo)
+        size = verifier.count_code_lines(repo)
+        self.assertLessEqual(size["code_lines"], 6000)
+        self.assertLessEqual(verifier.count_repository_files(repo), 55)
+        self.assertFalse((repo / ".s11-capacity").exists())
+        self.assertFalse((repo / "frontend/tests/functionality.spec.ts").exists())
+        self.assertFalse((repo / "frontend/playwright.config.ts").exists())
+        package = json.loads((repo / "frontend/package.json").read_text(encoding="utf-8"))
+        self.assertNotIn("@playwright/test", package.get("devDependencies", {}))
+        self.assertNotIn("test:e2e", package.get("scripts", {}))
+        self.assertTrue((repo / "frontend/src/views/WorkbenchView.vue").is_file())
+        self.assertTrue((repo / "backend/app/routers/resource.py").is_file())
+        operations = []
+        for service in (repo / "backend/app/services").glob("*.py"):
+            match = re.search(r'OPERATION_TERM\s*=\s*"([^"]+)"', service.read_text(encoding="utf-8"))
+            if match:
+                operations.append(match.group(1))
+        self.assertGreaterEqual(len(operations), 18)
+        self.assertTrue(set(operations) <= set(topic_map_v3.APPROVED_OPERATION_TERMS))
 
     def test_compose_uses_service_name_for_proxy(self):
         repo = self.root / "compose"

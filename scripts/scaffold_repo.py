@@ -46,8 +46,10 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import repo_rules as rules  # noqa: E402
 import github_settings
 import domain_rules
+import topic_map_v3
 
 DEFAULT_SPEC_NAME = "spec-data-engineering.json"
+DEFAULT_LAYOUT = "compact"
 MIN_SPEC_MODULES = 18
 
 # 项目编号：<前缀 2~4 个字母><5 位数>，5 位数首位固定是 1（10001–19999），例如 cc10001。
@@ -386,6 +388,21 @@ def class_name(key: str) -> str:
     return "".join(part.capitalize() for part in key.replace("-", "_").split("_") if part)
 
 
+def module_operation_term(module: dict) -> str:
+    """Choose a downstream-approved operation for generated source anchors."""
+    key = str(module.get("key") or "")
+    text = " ".join(
+        str(module.get(field) or "")
+        for field in ("name", "entity", "desc")
+    )
+    text += " " + " ".join(
+        str(value)
+        for field in ("fields", "statuses", "actions")
+        for value in (module.get(field) or [])
+    )
+    return topic_map_v3.operation_term_for(key, text, [])
+
+
 def json_array(items: list[str]) -> str:
     return "[" + ", ".join(json.dumps(item, ensure_ascii=False) for item in items) + "]"
 
@@ -534,13 +551,14 @@ __APP_DESC__
 ```text
 .
 ├── frontend/                 __FRONTEND_LABEL__ 前端
-│   ├── src/views/            每个业务模块一个页面
+│   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
+│   ├── src/data/modules.ts              18个业务模块配置
 │   ├── src/api/              统一请求封装
-│   ├── src/stores/           会话与筛选状态
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  __BACKEND_LABEL__ 后端
-│   ├── app/routers/          每个业务模块一组接口
-│   ├── app/services/         业务规则与状态流转
+│   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
 └── docker-compose.yml
@@ -575,8 +593,9 @@ __MODULE_TABLE__
 
 ## 约定
 
-- 每个模块的前端页面在 `frontend/src/views/<模块>/index.vue`，后端接口在
-  `backend/app/routers/<模块>.py`，业务规则在 `backend/app/services/<模块>.py`。
+- 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
+- 每个模块仍保留独立`backend/app/services/<模块>.py`；纯前端保留
+  `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 """
@@ -701,17 +720,14 @@ PACKAGE_JSON_VUE = """\
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "vue-tsc --noEmit",
-    "test:e2e": "playwright test"
+    "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {
-    "pinia": "^2.1.7",
     "vue": "^3.4.21",
     "vue-router": "^4.3.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
-    "@playwright/test": "^1.56.1",
     "@vitejs/plugin-vue": "^5.0.4",
     "typescript": "^5.4.3",
     "vite": "^5.2.6",
@@ -731,8 +747,7 @@ PACKAGE_JSON_REACT = """\
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit",
-    "test:e2e": "playwright test"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -741,7 +756,6 @@ PACKAGE_JSON_REACT = """\
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
-    "@playwright/test": "^1.56.1",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
@@ -1017,14 +1031,12 @@ TSCONFIG_REACT = """\
 
 MAIN_VUE = """\
 import { createApp } from 'vue'
-import { createPinia } from 'pinia'
 
 import App from './App.vue'
 import router from './router'
 import './styles/global.css'
 
 const app = createApp(App)
-app.use(createPinia())
 app.use(router)
 app.mount('#app')
 """
@@ -1073,7 +1085,7 @@ APP_VUE = """\
     <main class="app-main">
       <header class="app-head">
         <span class="head-desc">__APP_DESC__</span>
-        <span class="head-user">当前值班：{{ store.operator }} · {{ store.shiftLabel }}</span>
+        <span class="head-user">当前值班：数据工程组</span>
       </header>
       <RouterView />
     </main>
@@ -1081,10 +1093,6 @@ APP_VUE = """\
 </template>
 
 <script setup lang="ts">
-import { useSessionStore } from '@/stores/session'
-
-const store = useSessionStore()
-
 const navItems = __NAV_ITEMS__
 </script>
 """
@@ -2111,6 +2119,12 @@ __MODULE_BLOCKS__
 export const MODULE_BY_KEY: Map<string, ModuleMeta> = new Map(
   MODULES.map((item) => [item.key, item]),
 )
+
+export function moduleMeta(key: string): ModuleMeta {
+  const meta = MODULE_BY_KEY.get(key)
+  if (!meta) throw new Error(`没有登记名为 ${key} 的业务模块`)
+  return meta
+}
 """
 
 LOCAL_SEED_TS = """\
@@ -2186,6 +2200,7 @@ LOCAL_SERVICE_TS = """\
 import { MODULE_BY_KEY } from '@/data/modules'
 import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
+import { domainFor } from '@/domain'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
 const NEGATIVE_ACTIONS = ['撤销', '作废', '拒绝', '驳回', '停用', '忽略', '下线', '回滚']
@@ -2215,7 +2230,7 @@ export function listEntries(key: string, filters: Record<string, string> = {}): 
 
 export function createEntry(key: string, values: Record<string, string>): ActionResult {
   const meta = moduleMeta(key)
-  const missing = meta.fields.slice(0, 3).filter((field) => !values[field]?.trim())
+  const missing = domainFor(key).validate(values)
   if (missing.length) {
     return { ok: false, message: `缺少必填字段：${missing.join('、')}` }
   }
@@ -2234,7 +2249,7 @@ export function createEntry(key: string, values: Record<string, string>): Action
 
 export function runAction(key: string, id: number, action: string): ActionResult {
   const meta = moduleMeta(key)
-  const target = meta.actionTargets[action]
+  const target = domainFor(key).actionTarget(action)
   if (!target) {
     return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
   }
@@ -2311,6 +2326,54 @@ export function loadOverview(): OverviewResult {
     { label: '异常量', value: modules.reduce((sum, item) => sum + item.abnormal, 0) },
   ]
   return { cards, modules }
+}
+"""
+
+LOCAL_DOMAIN_TS = """\
+import type { EntryRow } from '@/data/types'
+
+export const MODULE = '__KEY__'
+export const ENTITY = '__ENTITY__'
+export const NAME = '__NAME__'
+export const OPERATION_TERM = '__OPERATION_TERM__'
+export const FIELDS = __FIELDS__
+export const REQUIRED_FIELDS = __REQUIRED_FIELDS__
+export const STATUS_ORDER = __STATUSES__
+export const ACTION_RULES: Record<string, string> = __ACTION_RULES__
+
+export function validate(values: Record<string, string>): string[] {
+  return REQUIRED_FIELDS.filter((field) => !values[field]?.trim())
+}
+
+export function actionTarget(action: string): string | undefined {
+  return ACTION_RULES[action]
+}
+
+export function domainSnapshot(rows: EntryRow[]) {
+  return {
+    module: MODULE,
+    entity: ENTITY,
+    artifact: `${ENTITY}数据集`,
+    count: rows.length,
+    abnormal: rows.filter((row) => row.abnormal).length,
+    byStatus: Object.fromEntries(
+      STATUS_ORDER.map((status) => [status, rows.filter((row) => row.status === status).length]),
+    ),
+  }
+}
+"""
+
+LOCAL_DOMAIN_INDEX = """\
+__IMPORTS__
+
+const DOMAINS = {
+__ENTRIES__
+}
+
+export function domainFor(key: string) {
+  const domain = DOMAINS[key as keyof typeof DOMAINS]
+  if (!domain) throw new Error(`没有登记名为 ${key} 的本地领域模块`)
+  return domain
 }
 """
 
@@ -2741,6 +2804,501 @@ onMounted(refresh)
 </script>
 """
 
+BACKEND_SERVICE_TS = """\
+import { request } from './client'
+import { moduleMeta } from '@/data/modules'
+import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+
+export { moduleMeta }
+
+export async function listEntries(
+  key: string,
+  filters: Record<string, string> = {},
+): Promise<PageResult> {
+  const query = new URLSearchParams(filters).toString()
+  const response = await request(`/api/${key}?${query}`)
+  if (!response.ok) throw new Error('业务数据读取失败')
+  return await response.json()
+}
+
+export async function createEntry(
+  key: string,
+  values: Record<string, string>,
+): Promise<ActionResult> {
+  const response = await request(`/api/${key}`, {
+    method: 'POST',
+    body: JSON.stringify({ values }),
+  })
+  return await response.json()
+}
+
+export async function runAction(
+  key: string,
+  id: number,
+  action: string,
+): Promise<ActionResult> {
+  const response = await request(`/api/${key}/${id}/actions`, {
+    method: 'POST',
+    body: JSON.stringify({ action }),
+  })
+  return await response.json()
+}
+
+export async function downloadEntries(
+  key: string,
+  filters: Record<string, string> = {},
+): Promise<void> {
+  const query = new URLSearchParams(filters).toString()
+  const response = await request(`/api/${key}/export?${query}`)
+  if (!response.ok) throw new Error('业务数据导出失败')
+  const url = URL.createObjectURL(await response.blob())
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${key}.csv`
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+  URL.revokeObjectURL(url)
+}
+
+export async function loadOverview(): Promise<OverviewResult> {
+  const response = await request('/api/overview')
+  if (!response.ok) throw new Error('运营概览读取失败')
+  return await response.json()
+}
+"""
+
+WORKBENCH_VUE = """\
+<template>
+  <section class="page" :data-module="meta.key">
+    <header class="page-head">
+      <div>
+        <h2>{{ meta.name }}</h2>
+        <p class="page-desc">{{ meta.desc }}</p>
+      </div>
+      <div class="page-actions">
+        <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">
+          登记{{ meta.entity }}
+        </button>
+        <button class="btn" data-testid="export" type="button" @click="exportRows">
+          导出{{ meta.name }}清单
+        </button>
+      </div>
+    </header>
+
+    <div class="stat-row">
+      <article v-for="item in stats" :key="item.label" class="stat-card">
+        <span class="stat-label">{{ item.label }}</span>
+        <strong class="stat-value">{{ item.value }}</strong>
+      </article>
+    </div>
+
+    <p class="status-legend">
+      <span v-for="item in statusSummary" :key="item.status" class="legend-item">
+        {{ item.status }}：{{ item.count }}
+      </span>
+    </p>
+
+    <form class="filter-bar" @submit.prevent="reload">
+      <label v-for="field in filterFields" :key="field" class="filter-item">
+        <span>{{ field }}</span>
+        <input v-model="filters[field]" :data-testid="`filter-${field}`" :placeholder="`按${field}检索`" />
+      </label>
+      <button class="btn" data-testid="query" type="submit">查询</button>
+      <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
+    </form>
+
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th v-for="column in meta.fields" :key="column">{{ column }}</th>
+          <th>当前状态</th>
+          <th>可执行动作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
+          <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
+          <td>{{ row.status }}</td>
+          <td class="row-actions">
+            <button
+              v-for="action in meta.actions"
+              :key="action"
+              class="link"
+              type="button"
+              :data-testid="`action-${row.id}-${action}`"
+              @click="runAction(action, row)"
+            >
+              {{ action }}
+            </button>
+          </td>
+        </tr>
+        <tr v-if="!rows.length">
+          <td :colspan="meta.fields.length + 2" class="empty-state">
+            暂无{{ meta.name }}数据，可先登记{{ meta.entity }}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
+      <form class="modal" @submit.prevent="submitCreate">
+        <h3>登记{{ meta.entity }}</h3>
+        <label v-for="field in meta.fields" :key="field" class="create-field">
+          <span>{{ field }}</span>
+          <input v-model="createValues[field]" :data-testid="`create-${field}`" required />
+        </label>
+        <div class="page-actions">
+          <button class="btn" type="button" @click="showCreate = false">取消</button>
+          <button class="btn primary" data-testid="submit-create" type="submit" :disabled="creating">
+            {{ creating ? '提交中…' : '确认登记' }}
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <footer class="page-foot">
+      <span>共 {{ total }} 条{{ meta.name }}记录</span>
+      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+    </footer>
+  </section>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue'
+
+import {
+  createEntry,
+  downloadEntries,
+  listEntries,
+  moduleMeta,
+  runAction as applyAction,
+} from '__SERVICE_MODULE__'
+import type { EntryRow } from '@/data/types'
+
+const props = defineProps<{ moduleKey: string }>()
+const meta = moduleMeta(props.moduleKey)
+const rows = ref<EntryRow[]>([])
+const total = ref(0)
+const errorMessage = ref('')
+const filters = ref<Record<string, string>>({})
+const filterFields = meta.fields.slice(0, 3)
+const showCreate = ref(false)
+const creating = ref(false)
+const createValues = ref<Record<string, string>>({})
+const stats = computed(() => [
+  { label: meta.metrics[0], value: total.value },
+  { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
+  {
+    label: meta.metrics[2],
+    value: rows.value.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
+  },
+])
+const statusSummary = computed(() =>
+  meta.statuses.map((status) => ({
+    status,
+    count: rows.value.filter((row) => String(row.status) === status).length,
+  })),
+)
+
+function resetFilters() {
+  filters.value = {}
+  void reload()
+}
+
+async function exportRows() {
+  errorMessage.value = ''
+  try {
+    await downloadEntries(meta.key, filters.value)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '导出失败'
+  }
+}
+
+function openCreate() {
+  createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
+  errorMessage.value = ''
+  showCreate.value = true
+}
+
+async function submitCreate() {
+  creating.value = true
+  errorMessage.value = ''
+  try {
+    const result = await createEntry(meta.key, createValues.value)
+    if (!result.ok) throw new Error(result.message)
+    showCreate.value = false
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '登记失败'
+  } finally {
+    creating.value = false
+  }
+}
+
+async function runAction(action: string, row: EntryRow) {
+  errorMessage.value = ''
+  try {
+    const result = await applyAction(meta.key, Number(row.id), action)
+    if (!result.ok) throw new Error(result.message)
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '操作失败'
+  }
+}
+
+async function reload() {
+  errorMessage.value = ''
+  try {
+    const payload = await listEntries(meta.key, filters.value)
+    rows.value = payload.items
+    total.value = payload.total
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
+  }
+}
+
+onMounted(reload)
+</script>
+"""
+
+MODULE_WRAPPER_VUE = """\
+<template>
+  <WorkbenchView module-key="__KEY__" />
+</template>
+
+<script setup lang="ts">
+import WorkbenchView from '@/views/WorkbenchView.vue'
+</script>
+"""
+
+WORKBENCH_REACT = """\
+import { useCallback, useEffect, useMemo, useState } from 'react'
+
+import {
+  createEntry,
+  downloadEntries,
+  listEntries,
+  moduleMeta,
+  runAction as applyAction,
+} from '__SERVICE_MODULE__'
+import type { EntryRow } from '@/data/types'
+
+export default function WorkbenchView({ moduleKey }: { moduleKey: string }) {
+  const meta = moduleMeta(moduleKey)
+  const [rows, setRows] = useState<EntryRow[]>([])
+  const [total, setTotal] = useState(0)
+  const [errorMessage, setErrorMessage] = useState('')
+  const [filters, setFilters] = useState<Record<string, string>>({})
+  const [showCreate, setShowCreate] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [createValues, setCreateValues] = useState<Record<string, string>>({})
+  const filterFields = useMemo(() => meta.fields.slice(0, 3), [meta])
+  const stats = useMemo(() => [
+    { label: meta.metrics[0], value: total },
+    { label: meta.metrics[1], value: rows.filter((row) => row.status === meta.statuses[1]).length },
+    {
+      label: meta.metrics[2],
+      value: rows.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
+    },
+  ], [meta, rows, total])
+
+  const reload = useCallback(async () => {
+    setErrorMessage('')
+    try {
+      const payload = await listEntries(meta.key, filters)
+      setRows(payload.items)
+      setTotal(payload.total)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '业务列表读取失败')
+    }
+  }, [filters, meta.key])
+
+  useEffect(() => {
+    void reload()
+  }, [reload])
+
+  function openCreate() {
+    setCreateValues(Object.fromEntries(meta.fields.map((field) => [field, ''])))
+    setErrorMessage('')
+    setShowCreate(true)
+  }
+
+  async function submitCreate(event: React.FormEvent) {
+    event.preventDefault()
+    setCreating(true)
+    setErrorMessage('')
+    try {
+      const result = await createEntry(meta.key, createValues)
+      if (!result.ok) throw new Error(result.message)
+      setShowCreate(false)
+      await reload()
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '登记失败')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  async function runAction(action: string, row: EntryRow) {
+    setErrorMessage('')
+    try {
+      const result = await applyAction(meta.key, Number(row.id), action)
+      if (!result.ok) throw new Error(result.message)
+      await reload()
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '操作失败')
+    }
+  }
+
+  async function exportRows() {
+    try {
+      await downloadEntries(meta.key, filters)
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '导出失败')
+    }
+  }
+
+  return (
+    <section className="page" data-module={meta.key}>
+      <header className="page-head">
+        <div>
+          <h2>{meta.name}</h2>
+          <p className="page-desc">{meta.desc}</p>
+        </div>
+        <div className="page-actions">
+          <button className="btn primary" data-testid="open-create" type="button" onClick={openCreate}>
+            登记{meta.entity}
+          </button>
+          <button className="btn" data-testid="export" type="button" onClick={() => void exportRows()}>
+            导出{meta.name}清单
+          </button>
+        </div>
+      </header>
+
+      <div className="stat-row">
+        {stats.map((item) => (
+          <article key={item.label} className="stat-card">
+            <span className="stat-label">{item.label}</span>
+            <strong className="stat-value">{item.value}</strong>
+          </article>
+        ))}
+      </div>
+
+      <form className="filter-bar" onSubmit={(event) => { event.preventDefault(); void reload() }}>
+        {filterFields.map((field) => (
+          <label key={field} className="filter-item">
+            <span>{field}</span>
+            <input
+              data-testid={`filter-${field}`}
+              value={filters[field] ?? ''}
+              placeholder={`按${field}检索`}
+              onChange={(event) => setFilters({ ...filters, [field]: event.target.value })}
+            />
+          </label>
+        ))}
+        <button className="btn" data-testid="query" type="submit">查询</button>
+        <button
+          className="btn ghost"
+          data-testid="reset"
+          type="button"
+          onClick={() => setFilters({})}
+        >
+          重置条件
+        </button>
+      </form>
+
+      <table className="data-table">
+        <thead>
+          <tr>
+            {meta.fields.map((column) => <th key={column}>{column}</th>)}
+            <th>当前状态</th>
+            <th>可执行动作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={String(row.id)} data-testid={`row-${row.id}`} data-status={String(row.status)}>
+              {meta.fields.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
+              <td>{row.status}</td>
+              <td className="row-actions">
+                {meta.actions.map((action) => (
+                  <button
+                    key={action}
+                    className="link"
+                    type="button"
+                    data-testid={`action-${row.id}-${action}`}
+                    onClick={() => void runAction(action, row)}
+                  >
+                    {action}
+                  </button>
+                ))}
+              </td>
+            </tr>
+          ))}
+          {!rows.length && (
+            <tr>
+              <td className="empty-state" colSpan={meta.fields.length + 2}>
+                暂无{meta.name}数据，可先登记{meta.entity}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+
+      {showCreate && (
+        <div className="modal-backdrop" data-testid="create-modal">
+          <form className="modal" onSubmit={(event) => void submitCreate(event)}>
+            <h3>登记{meta.entity}</h3>
+            {meta.fields.map((field) => (
+              <label key={field} className="create-field">
+                <span>{field}</span>
+                <input
+                  data-testid={`create-${field}`}
+                  value={createValues[field] ?? ''}
+                  onChange={(event) => setCreateValues({ ...createValues, [field]: event.target.value })}
+                  required
+                />
+              </label>
+            ))}
+            <div className="page-actions">
+              <button className="btn" type="button" onClick={() => setShowCreate(false)}>取消</button>
+              <button className="btn primary" data-testid="submit-create" type="submit" disabled={creating}>
+                {creating ? '提交中…' : '确认登记'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      <footer className="page-foot">
+        <span>共 {total} 条{meta.name}记录</span>
+        {errorMessage && <span className="error-text">{errorMessage}</span>}
+      </footer>
+    </section>
+  )
+}
+"""
+
+MODULE_WRAPPER_REACT = """\
+import WorkbenchView from '@/views/WorkbenchView'
+
+export default function __CLASS__View() {
+  return <WorkbenchView moduleKey="__KEY__" />
+}
+"""
+
+WORKBENCH_ROUTE_REACT = """\
+import { useParams } from 'react-router-dom'
+
+import WorkbenchView from '@/views/WorkbenchView'
+
+export default function WorkbenchRoute() {
+  const { moduleKey = '' } = useParams()
+  return <WorkbenchView moduleKey={moduleKey} />
+}
+"""
+
 DASHBOARD_REACT_LOCAL = """\
 import { useCallback, useEffect, useState } from 'react'
 
@@ -2823,10 +3381,10 @@ __APP_DESC__
 ```text
 .
 ├── frontend/                 __FRONTEND_LABEL__ 前端（唯一运行单元）
-│   ├── src/views/            每个业务模块一个页面
+│   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
+│   ├── src/domain/           每个模块独立数据计算与状态逻辑
 │   ├── src/api/local-service.ts   本地数据服务：列表、筛选、动作流转、导出
 │   ├── src/data/             模块元数据 / 示例数据 / localStorage 持久化
-│   ├── src/stores/           会话与筛选状态
 │   └── vite.config.ts        dev server 配置（open: false，无 /api 代理）
 ├── .gitignore
 └── docker-compose.yml
@@ -2855,11 +3413,12 @@ __MODULE_TABLE__
 
 ## 约定
 
-- 每个模块的页面在 `frontend/src/views/<模块>/index.vue`，页面只负责渲染，读写统一走
+- 所有模块共享 `frontend/src/views/WorkbenchView.vue|tsx`，读写统一走
   `frontend/src/api/local-service.ts`。
 - 字段、状态、动作与流转目标集中在 `frontend/src/data/modules.ts`；示例数据在
   `frontend/src/data/seed.ts`。
-- 状态流转只允许在 `local-service.ts` 里改，页面组件不做业务判断。
+- 状态流转由 `local-service.ts` 统一落盘，模块级字段校验和动作规则在
+  `frontend/src/domain/<模块>.ts`，共享页面不写业务判断。
 - 想回到初始数据：清掉浏览器里 `__STORAGE_KEY__` 这一项，或调用 `resetModule(模块)`。
 """
 
@@ -2937,10 +3496,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for module in ROUTERS:
-    app.include_router(module.router)
-
-
 @app.get("/api/health")
 def health() -> dict[str, object]:
     """健康检查：确认服务已经监听、示例数据已经就绪。"""
@@ -2951,6 +3506,12 @@ def health() -> dict[str, object]:
 def overview() -> dict[str, object]:
     """运营概览：把各业务模块的待处理量汇总成看板卡片。"""
     return store.overview()
+
+
+# 资源路由含 /api/{module}，必须放在 health / overview 之后注册，
+# 否则固定路径会被动态路径抢先匹配。
+for module in ROUTERS:
+    app.include_router(module.router)
 '''
 
 ROUTERS_INIT = '''\
@@ -2965,6 +3526,15 @@ from __future__ import annotations
 __IMPORTS__
 
 ROUTERS = [__MODULES__]
+'''
+
+ROUTERS_INIT_COMPACT = '''\
+"""业务路由汇总：所有模块共用一套资源路由，由领域服务完成分派。"""
+from __future__ import annotations
+
+from app.routers import resource
+
+ROUTERS = [resource]
 '''
 
 BACKEND_CONFIG = '''\
@@ -3082,6 +3652,266 @@ class ActionPayload(BaseModel):
     remark: str | None = None
 
 __SCHEMAS__
+'''
+
+BACKEND_SCHEMAS_COMPACT = '''\
+"""通用接口契约；模块字段由领域服务持有，不再为每个模块复制一份模型类。"""
+from __future__ import annotations
+
+from typing import Any, Generic, TypeVar
+
+from pydantic import BaseModel, Field
+
+T = TypeVar("T")
+
+
+class PageResult(BaseModel, Generic[T]):
+    items: list[T]
+    total: int
+    page: int = 1
+    size: int = 20
+
+
+class ActionResult(BaseModel):
+    ok: bool
+    message: str
+    entry: dict[str, Any] | None = None
+
+
+class EntryPayload(BaseModel):
+    values: dict[str, Any] = Field(default_factory=dict)
+    remark: str | None = None
+
+
+class ActionPayload(BaseModel):
+    action: str
+    remark: str | None = None
+'''
+
+SERVICE_BASE_PY = '''\
+"""模块服务基类：共享查询、登记、动作和统计骨架，业务差异留在各模块文件。"""
+from __future__ import annotations
+
+from typing import Any
+
+from app.store import store
+
+
+class BaseModuleService:
+    MODULE = ""
+    ENTITY = ""
+    LIST_FIELDS: list[str] = []
+    REQUIRED_FIELDS: list[str] = []
+    STATUS_ORDER: list[str] = []
+    ACTION_RULES: dict[str, str] = {}
+    NEGATIVE_ACTIONS: list[str] = []
+
+    def list_entries(
+        self,
+        *,
+        filters: dict[str, str] | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        rows = list(store.rows(self.MODULE))
+        for field, expected in (filters or {}).items():
+            if field in self.LIST_FIELDS:
+                rows = [
+                    row for row in rows
+                    if expected.casefold() in str(row.get(field, "")).casefold()
+                ]
+        if keyword and self.LIST_FIELDS:
+            field = self.LIST_FIELDS[0]
+            rows = [row for row in rows if keyword.casefold() in str(row.get(field, "")).casefold()]
+        if status:
+            rows = [row for row in rows if row.get("status") == status]
+        total = len(rows)
+        start = (page - 1) * size
+        return rows[start:start + size], total
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        return store.find(self.MODULE, entry_id)
+
+    def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        missing = [
+            field for field in self.REQUIRED_FIELDS
+            if not str(values.get(field) or "").strip()
+        ]
+        if missing:
+            return None, missing
+        rows = store.rows(self.MODULE)
+        entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
+        entry.update({field: values.get(field) for field in self.LIST_FIELDS})
+        entry["status"] = self.STATUS_ORDER[0]
+        entry["pending"] = True
+        entry["abnormal"] = False
+        rows.append(entry)
+        return entry, []
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        target = self.ACTION_RULES.get(action)
+        if target is None:
+            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
+        entry["status"] = target
+        entry["pending"] = target != self.STATUS_ORDER[-1]
+        entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        return entry, f"{self.ENTITY}已{action}"
+
+    def domain_snapshot(self) -> dict[str, Any]:
+        """输出模块级数据质量快照，供跨模块消费和题位源码锚点使用。"""
+        rows = store.rows(self.MODULE)
+        by_status = {
+            status: sum(1 for row in rows if row.get("status") == status)
+            for status in self.STATUS_ORDER
+        }
+        return {
+            "module": self.MODULE,
+            "entity": self.ENTITY,
+            "artifact": f"{self.ENTITY}数据集",
+            "count": len(rows),
+            "by_status": by_status,
+            "abnormal": sum(1 for row in rows if row.get("abnormal")),
+        }
+'''
+
+SERVICE_COMPACT_PY = '''\
+"""__NAME__领域服务：字段、状态和动作来自业务配置，数据处理骨架由基类复用。"""
+from __future__ import annotations
+
+from app.services.base import BaseModuleService
+
+
+class __CLASS__Service(BaseModuleService):
+    MODULE = "__KEY__"
+    ENTITY = "__ENTITY__"
+    OPERATION_TERM = "__OPERATION_TERM__"
+    LIST_FIELDS = __FIELDS__
+    REQUIRED_FIELDS = __REQUIRED_FIELDS__
+    STATUS_ORDER = __STATUSES__
+    ACTION_RULES = __ACTION_RULES__
+    NEGATIVE_ACTIONS = __NEGATIVE_ACTIONS__
+'''
+
+SERVICES_INIT_COMPACT = '''\
+"""领域服务注册表：通用资源路由按模块 key 分派到独立业务服务。"""
+from __future__ import annotations
+
+from app.services.base import BaseModuleService
+__IMPORTS__
+
+SERVICES: dict[str, BaseModuleService] = {
+__SERVICES__
+}
+
+
+def service_for(module: str) -> BaseModuleService | None:
+    return SERVICES.get(module)
+'''
+
+ROUTER_RESOURCE_PY = '''\
+"""统一资源接口：查询、导出、登记和动作按模块 key 分派到领域服务。"""
+from __future__ import annotations
+
+import csv
+import io
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+
+from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.services import service_for
+
+router = APIRouter(prefix="/api", tags=["业务资源"])
+
+
+def require_service(module: str):
+    service = service_for(module)
+    if service is None:
+        raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
+    return service
+
+
+@router.get("/{module}", response_model=PageResult[dict])
+def list_entries(
+    module: str,
+    request: Request,
+    keyword: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=200),
+) -> PageResult[dict]:
+    service = require_service(module)
+    filters = {
+        key: value.strip()
+        for key, value in request.query_params.items()
+        if key in service.LIST_FIELDS and value.strip()
+    }
+    items, total = service.list_entries(
+        filters=filters, keyword=keyword, status=status, page=page, size=size)
+    return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/{module}/export")
+def export_entries(
+    module: str,
+    request: Request,
+    keyword: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+) -> StreamingResponse:
+    service = require_service(module)
+    filters = {
+        key: value.strip()
+        for key, value in request.query_params.items()
+        if key in service.LIST_FIELDS and value.strip()
+    }
+    items, _ = service.list_entries(
+        filters=filters, keyword=keyword, status=status, page=1, size=1_000_000)
+    output = io.StringIO()
+    output.write("\\ufeff")
+    writer = csv.writer(output, lineterminator="\\n")
+    writer.writerow(["id", *service.LIST_FIELDS, "status"])
+    for item in items:
+        values = [item.get("id"), *(item.get(field, "") for field in service.LIST_FIELDS),
+                  item.get("status", "")]
+        writer.writerow([
+            "'" + str(value) if str(value or "").startswith(("=", "+", "-", "@")) else value
+            for value in values
+        ])
+    return StreamingResponse(
+        iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{module}.csv"'},
+    )
+
+
+@router.get("/{module}/{entry_id}", response_model=dict)
+def get_entry(module: str, entry_id: int) -> dict[str, Any]:
+    service = require_service(module)
+    entry = service.get_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
+    return entry
+
+
+@router.post("/{module}", response_model=ActionResult)
+def create_entry(module: str, payload: EntryPayload) -> ActionResult:
+    service = require_service(module)
+    entry, missing = service.create_entry(payload.values)
+    if missing:
+        return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
+    return ActionResult(ok=True, message=f"{service.ENTITY}已登记", entry=entry)
+
+
+@router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
+def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
+    service = require_service(module)
+    entry, message = service.run_action(entry_id, payload.action.strip())
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
 '''
 
 ROUTER_PY = '''\
@@ -3877,6 +4707,170 @@ public class __CLASS__Controller {
 }
 """
 
+JAVA_RESOURCE_SERVICE = """\
+package com.example.__PKG__.service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/** 通用资源接口：一套 Controller 按模块 key 分派到各领域服务。 */
+public interface ResourceService {
+    String key();
+    List<Map<String, Object>> list(
+            Map<String, String> filters, String keyword, String status, int page, int size);
+    int count(Map<String, String> filters, String keyword, String status);
+    Optional<Map<String, Object>> find(long id);
+    List<String> validate(Map<String, Object> values);
+    Map<String, Object> create(Map<String, Object> values);
+    Map<String, Object> runAction(long id, String action);
+}
+"""
+
+JAVA_MODULE_REGISTRY = """\
+package com.example.__PKG__.service;
+
+import org.springframework.stereotype.Service;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/** 模块注册表：按路径中的模块 key 找到独立领域服务。 */
+@Service
+public class ModuleRegistry {
+
+    private final Map<String, ResourceService> services = new LinkedHashMap<>();
+
+    public ModuleRegistry(List<ResourceService> discovered) {
+        for (ResourceService service : discovered) {
+            services.put(service.key(), service);
+        }
+    }
+
+    public Optional<ResourceService> find(String module) {
+        return Optional.ofNullable(services.get(module));
+    }
+}
+"""
+
+JAVA_RESOURCE_CONTROLLER = """\
+package com.example.__PKG__.controller;
+
+import com.example.__PKG__.service.ModuleRegistry;
+import com.example.__PKG__.service.ResourceService;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+
+/** 统一资源接口：按模块 key 查询、导出、登记和执行动作。 */
+@RestController
+@RequestMapping("/api/{module}")
+public class ResourceController {
+
+    private final ModuleRegistry registry;
+
+    public ResourceController(ModuleRegistry registry) {
+        this.registry = registry;
+    }
+
+    private ResourceService service(String module) {
+        return registry.find(module)
+                .orElseThrow(() -> new IllegalArgumentException("未知业务模块：" + module));
+    }
+
+    private Map<String, String> filters(
+            ResourceService service, Map<String, String> params) {
+        Map<String, String> selected = new LinkedHashMap<>();
+        for (String field : service.key().isEmpty()
+                ? List.<String>of() : serviceFields(service, params)) {
+            String value = params.get(field);
+            if (value != null && !value.isBlank()) {
+                selected.put(field, value.trim());
+            }
+        }
+        return selected;
+    }
+
+    private List<String> serviceFields(ResourceService service, Map<String, String> params) {
+        return params.keySet().stream()
+                .filter(key -> !List.of("keyword", "status", "page", "size").contains(key))
+                .toList();
+    }
+
+    @GetMapping
+    public Map<String, Object> list(
+            @PathVariable String module,
+            @RequestParam Map<String, String> params,
+            @RequestParam(required = false) String keyword,
+            @RequestParam(required = false) String status,
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        ResourceService service = service(module);
+        List<Map<String, Object>> items = service.list(
+                filters(service, params), keyword, status, page, size);
+        return Map.of(
+                "items", items,
+                "total", service.count(filters(service, params), keyword, status),
+                "page", page,
+                "size", size);
+    }
+
+    @GetMapping("/export")
+    public ResponseEntity<byte[]> export(
+            @PathVariable String module,
+            @RequestParam Map<String, String> params,
+            @RequestParam(required = false) String keyword,
+            @RequestParam(required = false) String status) {
+        ResourceService service = service(module);
+        List<Map<String, Object>> items = service.list(
+                filters(service, params), keyword, status, 1, 1000000);
+        StringBuilder csv = new StringBuilder();
+        for (Map<String, Object> item : items) {
+            csv.append(item.values().stream().map(String::valueOf).toList()).append('\\n');
+        }
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=" + module + ".csv")
+                .contentType(new MediaType("text", "csv", StandardCharsets.UTF_8))
+                .body(csv.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    @GetMapping("/{id}")
+    public Map<String, Object> detail(@PathVariable String module, @PathVariable long id) {
+        ResourceService service = service(module);
+        return service.find(id)
+                .map(row -> Map.<String, Object>of("ok", true, "entry", row))
+                .orElseGet(() -> Map.of("ok", false, "message", "记录不存在或已归档"));
+    }
+
+    @PostMapping
+    public Map<String, Object> create(
+            @PathVariable String module,
+            @RequestBody Map<String, Object> values) {
+        ResourceService service = service(module);
+        List<String> missing = service.validate(values);
+        if (!missing.isEmpty()) {
+            return Map.of("ok", false, "message", "缺少必填字段：" + String.join("、", missing));
+        }
+        return Map.of("ok", true, "message", "记录已登记", "entry", service.create(values));
+    }
+
+    @PostMapping("/{id}/actions")
+    public Map<String, Object> runAction(
+            @PathVariable String module,
+            @PathVariable long id,
+            @RequestBody Map<String, Object> payload) {
+        return service(module).runAction(id, String.valueOf(payload.getOrDefault("action", "")));
+    }
+}
+"""
+
 JAVA_SERVICE = """\
 package com.example.__PKG__.service;
 
@@ -3888,6 +4882,7 @@ import java.util.*;
 @Service
 public class __CLASS__Service implements ModuleService {
 
+    private static final String OPERATION_TERM = "__OPERATION_TERM__";
     private static final List<String> LIST_FIELDS = List.of(__FIELDS__);
     private static final List<String> REQUIRED_FIELDS = List.of(__REQUIRED_FIELDS__);
     private static final List<String> STATUS_ORDER = List.of(__STATUSES__);
@@ -3902,6 +4897,11 @@ public class __CLASS__Service implements ModuleService {
     }
 
     /** 模块中文名，概览页按它给每一行命名。 */
+    @Override
+    public String key() {
+        return "__KEY__";
+    }
+
     @Override
     public String label() {
         return "__NAME__";
@@ -4057,7 +5057,7 @@ package com.example.__PKG__.service;
 import java.util.Map;
 
 /** 各业务模块共用的能力：给出模块名与记录条数，供概览页汇总。 */
-public interface ModuleService {
+public interface ModuleService extends ResourceService {
 
     /** 模块中文名。 */
     String label();
@@ -4287,6 +5287,187 @@ def _pick_page_template(module: dict, frontend_only: bool, **render_kw: object) 
     return render(template, **render_kw)
 
 
+def gen_frontend_vue_compact(spec: dict, out: Path) -> int:
+    """紧凑 Vue：一个共享工作台承载全部模块，模块目录只保留薄路由包装。"""
+    modules = spec["modules"]
+    frontend_only = spec["backend"] == "none"
+    fe = out / "frontend"
+    service_module = "@/api/local-service" if frontend_only else "@/api/backend-service"
+    lines = 0
+    files: dict[Path, str] = {
+        fe / "package.json": render(
+            PACKAGE_JSON_VUE, APP_SLUG=spec["app_slug"], FRONTEND_PORT=spec["port_frontend"],
+            REPO_KIND="frontend-only" if frontend_only else "fullstack"),
+        fe / "package-lock.json": render(
+            (SKILL_DIR / "templates/package-lock-vue.json").read_text(encoding="utf-8"),
+            APP_SLUG=spec["app_slug"]),
+        fe / "vite.config.ts": (
+            render(VITE_CONFIG_VUE_LOCAL, FRONTEND_PORT=spec["port_frontend"]) if frontend_only
+            else render(VITE_CONFIG_VUE, FRONTEND_PORT=spec["port_frontend"],
+                        BACKEND_PORT=spec["port_backend"])),
+        fe / "index.html": render(INDEX_HTML, APP_NAME=spec["app_name"], MAIN_EXT="ts"),
+        fe / "tsconfig.json": TSCONFIG_VUE,
+        fe / "Dockerfile": render(FRONTEND_DOCKERFILE, FRONTEND_PORT=spec["port_frontend"]),
+        fe / "src/main.ts": MAIN_VUE,
+        fe / "src/env.d.ts": ENV_D_TS,
+        fe / "src/App.vue": render(
+            APP_VUE, APP_NAME=spec["app_name"], APP_DESC=spec["app_desc"],
+            NAV_ITEMS=build_nav_items(modules)),
+        fe / "src/styles/global.css": GLOBAL_CSS + LOCAL_CSS_EXTRA if frontend_only else GLOBAL_CSS,
+        fe / "src/data/types.ts": LOCAL_TYPES_TS,
+        fe / "src/data/modules.ts": render(
+            LOCAL_MODULES_TS, MODULE_BLOCKS=build_local_module_blocks(modules)),
+        fe / "src/views/WorkbenchView.vue": render(
+            WORKBENCH_VUE, SERVICE_MODULE=service_module),
+    }
+    if frontend_only:
+        files.update({
+            fe / "src/data/seed.ts": render(
+                LOCAL_SEED_TS, SEED_BLOCKS=build_local_seed_blocks(modules)),
+            fe / "src/data/local-store.ts": render(
+                LOCAL_STORE_TS, APP_SLUG=spec["app_slug"]),
+            fe / "src/api/local-service.ts": LOCAL_SERVICE_TS,
+        })
+        domain_imports = []
+        domain_entries = []
+        for module in modules:
+            key = module["key"]
+            flow = module_actions(module)
+            domain_imports.append(f"import * as {key} from './{key}'")
+            domain_entries.append(f"  {key},")
+            files[fe / f"src/domain/{key}.ts"] = render(
+                LOCAL_DOMAIN_TS,
+                KEY=key, NAME=module["name"], ENTITY=module["entity"],
+                OPERATION_TERM=module_operation_term(module),
+                FIELDS=json.dumps(module["fields"], ensure_ascii=False),
+                REQUIRED_FIELDS=json.dumps(module["fields"][:3], ensure_ascii=False),
+                STATUSES=json.dumps(flow["statuses"], ensure_ascii=False),
+                ACTION_RULES=json.dumps(flow["rules"], ensure_ascii=False),
+            )
+        files[fe / "src/domain/index.ts"] = render(
+            LOCAL_DOMAIN_INDEX,
+            IMPORTS="\n".join(domain_imports),
+            ENTRIES="\n".join(domain_entries),
+        )
+    else:
+        files.update({
+            fe / "src/api/client.ts": CLIENT_TS,
+            fe / "src/api/backend-service.ts": BACKEND_SERVICE_TS,
+        })
+
+    view_imports = [
+        "import Overview from '@/views/Overview.vue'",
+        "import WorkbenchView from '@/views/WorkbenchView.vue'",
+    ]
+    routes = [
+        "    { path: '/:moduleKey', name: 'module', component: WorkbenchView, props: true },",
+    ]
+    files[fe / "src/router/index.ts"] = render(
+        ROUTER_TS, VIEW_IMPORTS="\n".join(view_imports), ROUTES="\n".join(routes))
+
+    fallback_cards = json.dumps(
+        [{"label": "业务模块", "value": 0}, {"label": "今日新增", "value": 0}], ensure_ascii=False)
+    fallback_modules = json.dumps(
+        [{"name": module["name"], "created": 0, "pending": 0, "abnormal": 0} for module in modules],
+        ensure_ascii=False)
+    files[fe / "src/views/Overview.vue"] = (
+        DASHBOARD_VUE_LOCAL if frontend_only
+        else render(DASHBOARD_VUE, FALLBACK_CARDS=fallback_cards,
+                    FALLBACK_MODULES=fallback_modules))
+    for path, content in files.items():
+        write(path, content)
+        lines += line_count(content)
+    return lines
+
+
+def gen_frontend_react_compact(spec: dict, out: Path) -> int:
+    """紧凑 React：共享工作台 + 每模块薄包装，不再复制完整页面实现。"""
+    modules = spec["modules"]
+    frontend_only = spec["backend"] == "none"
+    fe = out / "frontend"
+    service_module = "@/api/local-service" if frontend_only else "@/api/backend-service"
+    lines = 0
+    files: dict[Path, str] = {
+        fe / "package.json": render(
+            PACKAGE_JSON_REACT, APP_SLUG=spec["app_slug"], FRONTEND_PORT=spec["port_frontend"],
+            REPO_KIND="frontend-only" if frontend_only else "fullstack"),
+        fe / "package-lock.json": render(
+            (SKILL_DIR / "templates/package-lock-react.json").read_text(encoding="utf-8"),
+            APP_SLUG=spec["app_slug"]),
+        fe / "vite.config.ts": (
+            render(VITE_CONFIG_REACT_LOCAL, FRONTEND_PORT=spec["port_frontend"]) if frontend_only
+            else render(VITE_CONFIG_REACT, FRONTEND_PORT=spec["port_frontend"],
+                        BACKEND_PORT=spec["port_backend"])),
+        fe / "index.html": render(INDEX_HTML, APP_NAME=spec["app_name"], MAIN_EXT="tsx"),
+        fe / "tsconfig.json": TSCONFIG_REACT,
+        fe / "Dockerfile": render(FRONTEND_DOCKERFILE, FRONTEND_PORT=spec["port_frontend"]),
+        fe / "src/main.tsx": MAIN_REACT,
+        fe / "src/env.d.ts": ENV_D_TS,
+        fe / "src/styles/global.css": GLOBAL_CSS + LOCAL_CSS_EXTRA if frontend_only else GLOBAL_CSS,
+        fe / "src/data/types.ts": LOCAL_TYPES_TS,
+        fe / "src/data/modules.ts": render(
+            LOCAL_MODULES_TS, MODULE_BLOCKS=build_local_module_blocks(modules)),
+        fe / "src/views/WorkbenchView.tsx": render(
+            WORKBENCH_REACT, SERVICE_MODULE=service_module),
+    }
+    if frontend_only:
+        files.update({
+            fe / "src/data/seed.ts": render(
+                LOCAL_SEED_TS, SEED_BLOCKS=build_local_seed_blocks(modules)),
+            fe / "src/data/local-store.ts": render(
+                LOCAL_STORE_TS, APP_SLUG=spec["app_slug"]),
+            fe / "src/api/local-service.ts": LOCAL_SERVICE_TS,
+        })
+        domain_imports = []
+        domain_entries = []
+        for module in modules:
+            key = module["key"]
+            flow = module_actions(module)
+            domain_imports.append(f"import * as {key} from './{key}'")
+            domain_entries.append(f"  {key},")
+            files[fe / f"src/domain/{key}.ts"] = render(
+                LOCAL_DOMAIN_TS,
+                KEY=key, NAME=module["name"], ENTITY=module["entity"],
+                OPERATION_TERM=module_operation_term(module),
+                FIELDS=json.dumps(module["fields"], ensure_ascii=False),
+                REQUIRED_FIELDS=json.dumps(module["fields"][:3], ensure_ascii=False),
+                STATUSES=json.dumps(flow["statuses"], ensure_ascii=False),
+                ACTION_RULES=json.dumps(flow["rules"], ensure_ascii=False),
+            )
+        files[fe / "src/domain/index.ts"] = render(
+            LOCAL_DOMAIN_INDEX,
+            IMPORTS="\n".join(domain_imports),
+            ENTRIES="\n".join(domain_entries),
+        )
+    else:
+        files.update({
+            fe / "src/api/client.ts": CLIENT_TS,
+            fe / "src/api/backend-service.ts": BACKEND_SERVICE_TS,
+        })
+
+    view_imports = ["import WorkbenchRoute from './views/WorkbenchRoute'"]
+    routes = ['          <Route path="/:moduleKey" element={<WorkbenchRoute />} />']
+    files[fe / "src/views/WorkbenchRoute.tsx"] = WORKBENCH_ROUTE_REACT
+    fallback_cards = json.dumps(
+        [{"label": "业务模块", "value": 0}, {"label": "今日新增", "value": 0}], ensure_ascii=False)
+    fallback_modules = json.dumps(
+        [{"name": module["name"], "created": 0, "pending": 0, "abnormal": 0} for module in modules],
+        ensure_ascii=False)
+    files[fe / "src/views/Overview.tsx"] = (
+        DASHBOARD_REACT_LOCAL if frontend_only
+        else render(DASHBOARD_REACT, FALLBACK_CARDS=fallback_cards,
+                    FALLBACK_MODULES=fallback_modules))
+    files[fe / "src/App.tsx"] = render(
+        APP_REACT, APP_NAME=spec["app_name"], APP_DESC=spec["app_desc"],
+        NAV_ITEMS=build_nav_items(modules),
+        REACT_VIEW_IMPORTS="\n".join(view_imports),
+        REACT_ROUTES="\n".join(routes))
+    for path, content in files.items():
+        write(path, content)
+        lines += line_count(content)
+    return lines
+
+
 def gen_frontend_vue(spec: dict, out: Path) -> int:
     modules = spec["modules"]
     frontend_only = spec["backend"] == "none"
@@ -4314,7 +5495,6 @@ def gen_frontend_vue(spec: dict, out: Path) -> int:
     files[fe / "src/App.vue"] = render(
         APP_VUE, APP_NAME=spec["app_name"], APP_DESC=spec["app_desc"],
         NAV_ITEMS=build_nav_items(modules))
-    files[fe / "src/stores/session.ts"] = render(SESSION_STORE, APP_SCOPE=spec["app_name"])
     files[fe / "src/styles/global.css"] = (
         GLOBAL_CSS + LOCAL_CSS_EXTRA if frontend_only else GLOBAL_CSS)
 
@@ -4329,16 +5509,6 @@ def gen_frontend_vue(spec: dict, out: Path) -> int:
         files[fe / "src/api/local-service.ts"] = LOCAL_SERVICE_TS
     else:
         files[fe / "src/api/client.ts"] = CLIENT_TS
-    files[fe / "playwright.config.ts"] = PLAYWRIGHT_CONFIG_TS
-    files[fe / "tests/functionality.spec.ts"] = render(
-        FUNCTIONALITY_TEST_TS,
-        MODULES=json.dumps([
-            {"key": module["key"], "fields": module["fields"], "actions": module["actions"],
-             "actionTargets": module["action_targets"], "shape": module.get("page_shape", "crud-table")}
-            for module in modules
-        ], ensure_ascii=False, indent=2),
-        REPO_KIND="frontend-only" if frontend_only else "fullstack")
-
     view_imports = ["import Overview from '@/views/Overview.vue'"]
     routes = []
     for module in modules:
@@ -4409,16 +5579,6 @@ def gen_frontend_react(spec: dict, out: Path) -> int:
         files[fe / "src/api/local-service.ts"] = LOCAL_SERVICE_TS
     else:
         files[fe / "src/api/client.ts"] = CLIENT_TS
-    files[fe / "playwright.config.ts"] = PLAYWRIGHT_CONFIG_TS
-    files[fe / "tests/functionality.spec.ts"] = render(
-        FUNCTIONALITY_TEST_TS,
-        MODULES=json.dumps([
-            {"key": module["key"], "fields": module["fields"], "actions": module["actions"],
-             "actionTargets": module["action_targets"], "shape": module.get("page_shape", "crud-table")}
-            for module in modules
-        ], ensure_ascii=False, indent=2),
-        REPO_KIND="frontend-only" if frontend_only else "fullstack")
-
     view_imports = []
     routes = []
     for module in modules:
@@ -4461,6 +5621,76 @@ def gen_frontend_react(spec: dict, out: Path) -> int:
         NAV_ITEMS=build_nav_items(modules),
         REACT_VIEW_IMPORTS="\n".join(view_imports),
         REACT_ROUTES="\n".join(routes))
+
+    for path, content in files.items():
+        write(path, content)
+        lines += line_count(content)
+    return lines
+
+
+def gen_backend_python_compact(spec: dict, out: Path) -> int:
+    """紧凑 FastAPI：一套资源路由 + 共享服务基类 + 18个独立领域服务。"""
+    modules = spec["modules"]
+    be = out / "backend"
+    lines = 0
+    files: dict[Path, str] = {
+        be / "requirements.txt": REQUIREMENTS,
+        be / "run.sh": render(BACKEND_RUN_SH, BACKEND_PORT=spec["port_backend"]),
+        be / "Dockerfile": render(BACKEND_DOCKERFILE, BACKEND_PORT=spec["port_backend"]),
+        be / "app/__init__.py": "",
+        be / "app/main.py": render(
+            BACKEND_MAIN, APP_NAME=spec["app_name"], BACKEND_PORT=spec["port_backend"]),
+        be / "app/routers/__init__.py": ROUTERS_INIT_COMPACT,
+        be / "app/routers/resource.py": ROUTER_RESOURCE_PY,
+        be / "app/config.py": render(
+            BACKEND_CONFIG, APP_NAME=spec["app_name"], BACKEND_PORT=spec["port_backend"],
+            FRONTEND_PORT=spec["port_frontend"]),
+        be / "app/store.py": BACKEND_STORE,
+        be / "app/schemas.py": BACKEND_SCHEMAS_COMPACT,
+        be / "app/services/base.py": SERVICE_BASE_PY,
+    }
+
+    seed_blocks = []
+    service_imports = []
+    service_entries = []
+    for module in modules:
+        key = module["key"]
+        cls = class_name(key)
+        flow = module_actions(module)
+        files[be / f"app/services/{key}.py"] = render(
+            SERVICE_COMPACT_PY,
+            KEY=key, ENTITY=module["entity"], CLASS=cls,
+            OPERATION_TERM=module_operation_term(module),
+            FIELDS=py_list(module["fields"]),
+            REQUIRED_FIELDS=py_list(module["fields"][:3]),
+            STATUSES=py_list(flow["statuses"]),
+            ACTION_RULES=json.dumps(flow["rules"], ensure_ascii=False),
+            NEGATIVE_ACTIONS=py_list(flow["negative"]),
+        )
+        service_imports.append(f"from app.services.{key} import {cls}Service")
+        service_entries.append(f'    "{key}": {cls}Service(),')
+
+        rows = []
+        for index in range(3):
+            row = {
+                "id": index + 1,
+                "status": flow["statuses"][index % len(flow["statuses"])],
+                "pending": index < 2,
+                "abnormal": index == 1,
+            }
+            for field in module["fields"]:
+                row[field] = sample_value(field, key, module["name"], index)
+            rows.append(row)
+        seed_blocks.append(
+            "    " + json.dumps(key, ensure_ascii=False) + ": "
+            + py_literal(rows, indent=4)
+        )
+    files[be / "app/services/__init__.py"] = render(
+        SERVICES_INIT_COMPACT,
+        IMPORTS="\n".join(service_imports),
+        SERVICES="\n".join(service_entries),
+    )
+    files[be / "app/seed.py"] = render(BACKEND_SEED, SEED_TABLE=",\n".join(seed_blocks))
 
     for path, content in files.items():
         write(path, content)
@@ -4560,6 +5790,58 @@ def gen_backend_python(spec: dict, out: Path) -> int:
     return lines
 
 
+def gen_backend_java_compact(spec: dict, out: Path) -> int:
+    """紧凑 Spring Boot：一套资源 Controller + 每模块独立 Service。"""
+    modules = spec["modules"]
+    be = out / "backend"
+    pkg = spec["app_slug"].replace("-", "")
+    lines = 0
+    files: dict[Path, str] = {
+        be / "pom.xml": render(JAVA_POM, APP_SLUG=spec["app_slug"], APP_NAME=spec["app_name"]),
+        be / "run.sh": render(JAVA_RUN_SH),
+        be / "Dockerfile": render(BACKEND_DOCKERFILE_JAVA, BACKEND_PORT=spec["port_backend"]),
+        be / "src/main/resources/application.yml": render(
+            JAVA_APP_YML, APP_SLUG=spec["app_slug"], BACKEND_PORT=spec["port_backend"]),
+        be / f"src/main/java/com/example/{pkg}/Application.java": render(
+            JAVA_APPLICATION, PKG=pkg, APP_NAME=spec["app_name"],
+            BACKEND_PORT=spec["port_backend"]),
+        be / f"src/main/java/com/example/{pkg}/controller/OverviewController.java": render(
+            JAVA_OVERVIEW, PKG=pkg, APP_NAME=spec["app_name"]),
+        be / f"src/main/java/com/example/{pkg}/controller/ResourceController.java": render(
+            JAVA_RESOURCE_CONTROLLER, PKG=pkg),
+        be / f"src/main/java/com/example/{pkg}/service/ResourceService.java": render(
+            JAVA_RESOURCE_SERVICE, PKG=pkg),
+        be / f"src/main/java/com/example/{pkg}/service/ModuleService.java": render(
+            JAVA_MODULE_SERVICE, PKG=pkg),
+        be / f"src/main/java/com/example/{pkg}/service/ModuleRegistry.java": render(
+            JAVA_MODULE_REGISTRY, PKG=pkg),
+        be / f"src/main/java/com/example/{pkg}/service/OverviewService.java": render(
+            JAVA_OVERVIEW_SERVICE, PKG=pkg),
+    }
+    for module in modules:
+        key = module["key"]
+        cls = class_name(key)
+        flow = module_actions(module)
+        action_rules = list(flow["rules"].items())
+        files[be / f"src/main/java/com/example/{pkg}/service/{cls}Service.java"] = render(
+            JAVA_SERVICE, PKG=pkg, KEY=key, NAME=module["name"], ENTITY=module["entity"],
+            CLASS=cls, OPERATION_TERM=module_operation_term(module),
+            FIELDS=", ".join(json.dumps(f, ensure_ascii=False) for f in module["fields"]),
+            REQUIRED_FIELDS=", ".join(
+                json.dumps(f, ensure_ascii=False) for f in module["fields"][:3]),
+            STATUSES=", ".join(json.dumps(s, ensure_ascii=False) for s in flow["statuses"]),
+            ACTION_RULES=", ".join(
+                f"{json.dumps(action, ensure_ascii=False)}, {json.dumps(target, ensure_ascii=False)}"
+                for action, target in action_rules),
+            NEGATIVE_ACTIONS=", ".join(
+                json.dumps(action, ensure_ascii=False) for action in flow["negative"]) or '"__none__"',
+        )
+    for path, content in files.items():
+        write(path, content)
+        lines += line_count(content)
+    return lines
+
+
 def gen_backend_java(spec: dict, out: Path) -> int:
     modules = spec["modules"]
     be = out / "backend"
@@ -4593,7 +5875,7 @@ def gen_backend_java(spec: dict, out: Path) -> int:
             FIELDS=", ".join(json.dumps(f, ensure_ascii=False) for f in module["fields"]))
         files[be / f"src/main/java/com/example/{pkg}/service/{cls}Service.java"] = render(
             JAVA_SERVICE, PKG=pkg, KEY=key, NAME=module["name"], ENTITY=module["entity"],
-            CLASS=cls,
+            CLASS=cls, OPERATION_TERM=module_operation_term(module),
             FIELDS=", ".join(json.dumps(f, ensure_ascii=False) for f in module["fields"]),
             REQUIRED_FIELDS=", ".join(json.dumps(f, ensure_ascii=False)
                                       for f in module["fields"][:3]),
@@ -4646,14 +5928,24 @@ def repo_kind(spec: dict) -> str:
     return "frontend-only" if spec["backend"] == "none" else "fullstack"
 
 
-def _scaffold_in_place(spec: dict, out: Path) -> dict:
+def _scaffold_in_place(spec: dict, out: Path, layout: str = DEFAULT_LAYOUT) -> dict:
     """在空目录中写文件；外部统一通过原子 scaffold 入口调用。"""
     out.mkdir(parents=True, exist_ok=False)
     frontend_only = spec["backend"] == "none"
     lines = 0
-    lines += gen_frontend_vue(spec, out) if spec["frontend"] == "vue" else gen_frontend_react(spec, out)
+    if spec["frontend"] == "vue":
+        lines += (gen_frontend_vue_compact(spec, out) if layout == "compact"
+                  else gen_frontend_vue(spec, out))
+    else:
+        lines += (gen_frontend_react_compact(spec, out) if layout == "compact"
+                  else gen_frontend_react(spec, out))
     if not frontend_only:
-        lines += gen_backend_python(spec, out) if spec["backend"] == "python" else gen_backend_java(spec, out)
+        if spec["backend"] == "python":
+            lines += (gen_backend_python_compact(spec, out) if layout == "compact"
+                      else gen_backend_python(spec, out))
+        else:
+            lines += (gen_backend_java_compact(spec, out) if layout == "compact"
+                      else gen_backend_java(spec, out))
 
     root_files = {
         out / ".gitignore": GITIGNORE,
@@ -4670,8 +5962,9 @@ def _scaffold_in_place(spec: dict, out: Path) -> dict:
             else render(MAKEFILE,
                         BACKEND_INSTALL="python3 -m venv .venv && .venv/bin/pip install -r requirements.txt",
                         BACKEND_RUN="./run.sh")),
-        out / ".env.example": "APP_ENV=local\n",
     }
+    if layout == "legacy":
+        root_files[out / ".env.example"] = "APP_ENV=local\n"
     for path, content in root_files.items():
         write(path, content)
         lines += line_count(content)
@@ -4682,7 +5975,7 @@ def _scaffold_in_place(spec: dict, out: Path) -> dict:
     return {"files": sum(1 for _ in out.rglob("*") if _.is_file()), "lines_written": lines}
 
 
-def scaffold(spec: dict, out: Path) -> dict:
+def scaffold(spec: dict, out: Path, layout: str = DEFAULT_LAYOUT) -> dict:
     """完整预检后在同盘临时目录生成，再原子移动到目标位置。
 
     任何 schema、模板或写盘错误都不会留下一个看似可交付的半成品仓库。
@@ -4691,6 +5984,8 @@ def scaffold(spec: dict, out: Path) -> dict:
     if topic_hits:
         raise SystemExit(banned_topic_report(topic_hits))
     normalized = normalize_spec(spec)
+    if layout not in {"compact", "legacy"}:
+        raise SystemExit(f"不支持 layout={layout!r}，可选 compact / legacy")
     out = Path(out).expanduser().resolve()
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise SystemExit(f"目标目录非空，先清空或换一个目录：{out}")
@@ -4698,7 +5993,7 @@ def scaffold(spec: dict, out: Path) -> dict:
     workspace = Path(tempfile.mkdtemp(prefix=f".{out.name}.build-", dir=out.parent))
     temporary_out = workspace / "repo"
     try:
-        result = _scaffold_in_place(normalized, temporary_out)
+        result = _scaffold_in_place(normalized, temporary_out, layout)
         if out.exists():
             out.rmdir()  # 只允许空目录占位
         temporary_out.replace(out)
@@ -4726,6 +6021,8 @@ def main() -> int:
     parser.add_argument("--no-github-check", action="store_true",
                         help="不查 GitHub（离线时用）；此时只按本地目录往后排编号")
     parser.add_argument("--git-init", action="store_true", help="顺手 git init 并做一次提交")
+    parser.add_argument("--layout", choices=["compact", "legacy"], default=DEFAULT_LAYOUT,
+                        help="compact 是默认缩仓布局；legacy 仅用于兼容旧模板回归")
     github_settings.add_arguments(parser)
     args = parser.parse_args()
     github_settings.configure_from_args(args)
@@ -4783,9 +6080,11 @@ def main() -> int:
             project = {"project_id": out.name, "prefix": parsed[0], "number": parsed[1],
                        "picked_from": "--out 目录名", "github_checked": False, "skipped": []}
 
-    result = scaffold(spec, out)
+    result = scaffold(spec, out, args.layout)
 
 # 规范化 spec 已在仓库内保存；外层再留一份便于任务管理，绝不删除用户输入文件。
+    if args.parent:
+        (container / ".s11-meta").mkdir(parents=True, exist_ok=True)
     if args.parent and args.spec:
         src = Path(args.spec).expanduser().resolve()
         shutil.copy2(out / ".s11-spec.json", container / src.name)
@@ -4809,6 +6108,8 @@ def main() -> int:
         "frontend": spec["frontend"],
         "backend": spec["backend"],
         "kind": repo_kind(spec),
+        "layout": args.layout,
+        "external_meta_dir": str(container / ".s11-meta") if args.parent else "",
         "modules": len(spec["modules"]),
         "files": result["files"],
         "lines_written": result["lines_written"],

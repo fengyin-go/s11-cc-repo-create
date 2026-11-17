@@ -1,6 +1,6 @@
 ---
 name: s11-cc-repo-create
-description: 为 solo11 全自动生成可供 s11-gsb-prompt-create 出题的数据工程底座仓库，默认每仓至少36个通过下游H1/H2/H3 v2硬闸的真实题位，并在仓库外生成提示词机会地图。支持多agent分仓并行、无人值守修复与清理、整体测试一轮、集中修复一轮、最终干净克隆启动联通验收及GitHub发布。用于单仓/批量造项目和扩充出题容量；不代替下游最终提示词、全局查重、模型运行或平台提交。
+description: 为 solo11 全自动生成可供 s11-gsb-prompt-create 出题的紧凑数据工程底座仓库，默认每仓至少36个通过下游H1/H2/H3 v3硬闸的真实题位，并在仓库外生成容量材料和提示词机会地图。支持共享前端/API、18个独立领域服务、多agent分仓并行、无人值守修复与清理、整体测试一轮、集中修复一轮、最终启动联通及GitHub发布。用于单仓/批量造项目和扩充出题容量；不代替下游最终提示词、全局查重、模型运行或平台提交。
 ---
 
 # S11 高容量底座仓库生成
@@ -13,7 +13,9 @@ description: 为 solo11 全自动生成可供 s11-gsb-prompt-create 出题的数
 - 默认每仓 **36个通过题位硬闸的候选**：12个可用模式各3条。设计时准备36张正式机会卡和12张同模式备用卡，共48个候选故事；储备不是有效容量。spec 至少18个模块是数学下限，实践建议20～24个真实业务topic。
 - Vue/React + Python/Java，或有真实本地数据计算与持久化的纯前端。默认 Vue + Python，不为变技术栈制造跨仓差异。纯前端不能假装真实网络采集/数仓服务。
 - 五类任务沿用下游准确名称和slug，`capacity-first`；30/30/30/5/5只是建议，不编造Bugfix或迁移目标，不人为埋bug凑数。
-- 完成指：真实业务实现 + >=36题位通过 + 提示词机会地图校验 + 查重 + 一轮整体测试/至多一轮集中修复 + 干净克隆启动联通 + 清理 + 用户要求的发布/本地交付。某仓不足就补业务、换候选，不改闸、不以备注放行。
+- 完成指：真实业务实现 + >=36题位通过 + 提示词机会地图校验 + 查重 + 紧凑体积预算 + 一轮整体测试/至多一轮集中修复 + 干净克隆启动联通 + 清理 + 用户要求的发布/本地交付。某仓不足就补业务、换候选，不改闸、不以备注放行。
+- 默认使用compact布局：18个模块各自保留独立领域服务文件；前端只生成一个共享`WorkbenchView`，后端只生成一套通用资源路由。禁止重新复制18套完整页面、router或测试。
+- 默认代码计行<=6000、普通clone文件硬上限60（基线约55，给真实业务测试留少量余量），并校验18个领域主体仍可派生36容量。`legacy`布局只用于旧模板回归，不是新仓默认交付。
 - 只生成底座、题位储备和提示词设计素材，不创建36个任务GitHub仓、不写最终tasks.xlsx、不跑模型、不提交平台。最终题面和历史查重仍归下游，不能承诺平台必过。
 - 生成提示词机会地图时必须写到生成仓库之外，默认 `<parent>/prompt-opportunities/<project_id>.json`；不得提交、推送或写入干净克隆。
 
@@ -59,26 +61,34 @@ python3 <skill>/scripts/run_pipeline.py --parent <parent> \
 
 ## 4. 落地容量契约，禁止纸面凑数
 
-仓库内提交：
+源码仓库只提交运行代码和精简spec，不提交容量设计材料。容量材料位于任务容器、仓库外：
 
 ```
-.s11-capacity/
-  candidate-pool.json       原始候选及淘汰/储备原因，不计入合格数
-  repo-topic-map.json       下游semantic-v2格式；>=36条task_plan
+<container>/
+  <project_id>/             可发布源码仓库
+  .s11-meta/
+    candidate-pool.json     原始候选及淘汰/储备原因，不计入合格数
+    repo-topic-map.json     下游semantic-v2格式；>=36条task_plan
+    prompt-opportunity-briefs.json
 ```
 
-每题包括下游完整 `domain_fit` v2、`difficulty_design` v2、真实任务意图、跨模块带行号连续源码原文；再按 [capacity-design.md](references/capacity-design.md) 填写 `support_evidence`。Bugfix只能来自可复现的真实缺陷；不得为候选数埋缺陷。保留不同数据结果/约束交互/设计冲突轴，不能只改对象名、复用一个重试模板。
+每题包括下游完整 `domain_fit` v2、`difficulty_design` v3、真实任务意图、跨模块带行号连续源码原文；再按 [capacity-design.md](references/capacity-design.md) 填写 `support_evidence`。Bugfix只能来自可复现的真实缺陷；不得为候选数埋缺陷。保留不同数据结果/约束交互/设计冲突轴，不能只改对象名、复用一个重试模板。
+
+v3硬字段不能省略：约束写入唯一`C1`/`C2`编号；`design_tradeoff.decision_axis`取下游批准枚举；每题写`workload_design`（>=55次有效工具调用、>=4切片、>=2模块、不同数据结果、独立验证、>=2验证路径）。`domain_chain.operation`只能使用采集/接入/抓取/爬取/导入/读取/解析/清洗/转换/标准化/关联/聚合/去重/校验/入湖/入库/落库/存储/写入/查询/计算/调度/回填/迁移/导出/切分/归并/合并/归档/水位。`batch_registry`、`error_handler`等固定映射见[capacity-design.md](references/capacity-design.md)。
 
 源码和容量 map 稳定后，用 `scripts/build_prompt_opportunities.py` 在仓库外生成提示词机会地图。机会地图记录业务故事、自然切入角度、H1/H2/H3设计事实、源码锚点和备用卡；不保存最终提示词，也不允许写进生成仓库。
 
-源码稳定后，固定源码基线，回填map的 `base_commit` 为源码提交；再单独提交map。容量检查接受该源码提交至当前HEAD之间**仅有 `.s11-capacity/` 下普通、非可执行JSON元数据变化**，避免“把HEAD写进自身提交文件”的循环；业务源码变化必须重新锚定、重审。
+源码稳定并提交后，把仓外map的 `base_commit` 直接写成最终源码HEAD。容量检查通过Git回查该HEAD中的源码锚点，不要求为map再制造元数据提交。业务源码变化后必须更新 `base_commit`、全部锚点并重跑容量闸。旧仓库仓库内 `.s11-capacity/` 继续兼容读取，但新仓不得放入源码仓库。
 
 ```bash
 python3 <skill>/scripts/check_prompt_capacity.py --repo <repo> \
+  --map <container>/.s11-meta/repo-topic-map.json \
   --downstream-skill <prompt-skill> --json-out <container>/prompt-capacity-report.json
 ```
 
 该闸调用真实下游validator（领域/类型/H1/H2/H3），不调用模型或建题。结构通过不等于语义全对：主控/独立reviewer还需根据源码复核真实数据流、可执行性、开放设计轴及同质化。失败补业务或淘汰替换，不伪造锚点/缺陷、不写假的pass报告。下游模式上限每种3、每topic 1～3及单仓上限均保留；12个可用模式必须各3条，不足36道时明确未完成，不能降级交付。
+
+仓外旧v2 map在首次检查时会由`topic_map_v3.py`原子补齐v3结构字段，报告记录`map_schema_upgraded: true`；仓库内旧布局map须显式加`--upgrade-map`再提交。自动补齐只解决结构，不替代真实workload、源码锚点和语义review。
 
 ## 5. 固定预算：测一轮 → 改一轮 → 只验启动联通
 
@@ -106,9 +116,9 @@ python3 <skill>/scripts/probe_startup.py --repo <repo> --clean-clone \
 
 只复用依赖下载缓存，不跨平台搬native node_modules/虚拟环境。最终probe报告标明 `verification_scope: startup-connectivity`，不缓存旧smoke成功结果、不声称浏览器全部业务正确。仅发布网络重试可复用同HEAD的现有报告，不重跑流水线。日志在仓外，临时克隆删净，只清本次PID/进程组。详见 [parallel-performance.md](references/parallel-performance.md)。
 
-交接给下游时，将已审题位图复制到批次目录，`base_commit` 改为实际最终源仓HEAD（不是源仓内材料引用的源码提交S），重新跑下游validator及历史查重；不改写已冻结源仓。题位设计是可复用储备，不是绕过下游重新核验的通行证。
+交接给下游时，复制已审题位图到批次目录；它本来就在源码仓库外，`base_commit` 应已等于最终源仓HEAD。重新跑下游validator及历史查重，不改写已冻结源仓。题位设计是可复用储备，不是绕过下游重新核验的通行证。
 
-完成后给：每仓路径/URL、SHA、领域/子方向、有效候选数与储备数、提示词机会地图路径/哈希、一次测试结果/一次修复清单/最终启动联通、静态/容量/查重/清理结果、各阶段耗时和缓存命中、发布结果、实际开了多少agent、阻塞与恢复命令。仅修改本skill时只报告实际改动及自测，不能声称已经生成36道题或已测到端到端提速倍数。
+完成后给：每仓路径/URL、SHA、布局、代码计行/文件数、领域/子方向、有效候选数与储备数、提示词机会地图路径/哈希、一次测试结果/一次修复清单/最终启动联通、静态/容量/查重/清理结果、各阶段耗时和缓存命中、发布结果、实际开了多少agent、阻塞与恢复命令。仅修改本skill时只报告实际改动及自测，不能声称已经生成36道题或已测到端到端提速倍数。
 
 ## 技能自检
 

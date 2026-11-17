@@ -18,6 +18,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import repo_rules as rules  # noqa: E402
 import check_prompt_capacity  # noqa: E402
+import topic_map_v3  # noqa: E402
 
 
 VERSION = 1
@@ -277,6 +278,7 @@ def build(
     out_path: str | Path | None = None,
     *,
     downstream_skill: str | Path | None = None,
+    map_path: str | Path | None = None,
 ) -> dict:
     repo = Path(repo).expanduser().resolve()
     briefs_path = Path(briefs_path).expanduser().resolve()
@@ -297,10 +299,12 @@ def build(
     if issues:
         return {"ok": False, "issues": issues}
 
-    map_path = repo / ".s11-capacity" / "repo-topic-map.json"
+    map_path = (Path(map_path).expanduser().resolve() if map_path
+                else rules.topic_map_path(repo))
     if not map_path.is_file():
         return {"ok": False, "issues": [f"缺少容量题位表：{map_path}"]}
     topic_map = _load_json(map_path)
+    topic_map_v3.normalize_map(topic_map)
     briefs_doc = _load_json(briefs_path)
     brief_rows = briefs_doc.get("opportunities")
     if not isinstance(brief_rows, list):
@@ -308,6 +312,7 @@ def build(
 
     capacity = check_prompt_capacity.check_capacity(
         repo,
+        map_path=map_path,
         downstream_skill=downstream_skill,
         target=TARGET_COUNT,
     )
@@ -363,6 +368,7 @@ def validate_existing(
     *,
     capacity: dict | None = None,
     expected_head: str | None = None,
+    map_path: str | Path | None = None,
 ) -> dict:
     """Validate a generated map without trusting its prior report or rewriting it."""
     repo = Path(repo).expanduser().resolve()
@@ -374,7 +380,8 @@ def validate_existing(
         issues.append("机会地图不得位于生成仓库内部")
     if opportunity_path.is_symlink() or not opportunity_path.is_file():
         issues.append(f"机会地图必须是仓库外普通文件：{opportunity_path}")
-    map_path = repo / ".s11-capacity" / "repo-topic-map.json"
+    map_path = (Path(map_path).expanduser().resolve() if map_path
+                else rules.topic_map_path(repo))
     if not map_path.is_file():
         issues.append(f"缺少容量题位表：{map_path}")
     if issues:
@@ -382,6 +389,7 @@ def validate_existing(
 
     try:
         topic_map = _load_json(map_path)
+        topic_map_v3.normalize_map(topic_map)
         payload = _load_json(opportunity_path)
         head = expected_head or _repo_head(repo)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -443,12 +451,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--briefs", required=True)
     parser.add_argument("--out")
+    parser.add_argument("--map")
     parser.add_argument("--downstream-skill")
     args = parser.parse_args(argv)
     result = build(
         args.repo,
         args.briefs,
         args.out,
+        map_path=args.map,
         downstream_skill=args.downstream_skill,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

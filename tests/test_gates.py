@@ -736,7 +736,7 @@ class BannedTopics(unittest.TestCase):
         """比下游只读 README 更严一档：源码里出现也算命中。"""
         repo = self.tmp / "source-hit"
         generate(repo)
-        page = repo / "frontend" / "src" / "views" / "datasource" / "index.vue"
+        page = repo / "backend" / "app" / "services" / "datasource.py"
         page.write_text(page.read_text(encoding="utf-8") + "\n<!-- 备件库存盘点 -->\n",
                         encoding="utf-8")
         compliance = self.verify(repo)["checks"]["compliance"]
@@ -922,9 +922,11 @@ class FrontendOnlyMode(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["checks"]["runnable_entries"]["ok"])
 
-    def test_enough_views_for_task_types(self):
-        views = list((self.vue_repo / "frontend" / "src" / "views").rglob("index.vue"))
-        self.assertGreaterEqual(len(views), 16, "页面少于 8 个会被 G6 判成禁用题型")
+    def test_enough_domain_modules_for_task_types(self):
+        domains = list((self.vue_repo / "frontend" / "src" / "domain").glob("*.ts"))
+        self.assertGreaterEqual(len(domains), 18, "紧凑布局仍须保留18个可独立修改的领域模块")
+        self.assertTrue(
+            (self.vue_repo / "frontend" / "src" / "views" / "WorkbenchView.vue").is_file())
 
     def test_backend_missing_without_marker_is_still_rejected(self):
         """全栈仓库的后端目录被删掉，不能靠「没有 backend」降级成纯前端蒙混过关。"""
@@ -934,7 +936,7 @@ class FrontendOnlyMode(unittest.TestCase):
         self.assertEqual(verifier.detect_repo_kind(fullstack), "fullstack")
         result = self.verify(fullstack)
         self.assertFalse(result["ok"])
-        self.assertIn("G1 结构", result["failures"][0])
+        self.assertTrue(any("G1 结构" in item for item in result["failures"]))
 
     def test_marker_removed_falls_back_to_fullstack(self):
         """纯前端仓库去掉 repoKind 标记后，就按全栈口径验收（缺后端 → 拦下）。"""

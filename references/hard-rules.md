@@ -1,6 +1,6 @@
 # 硬性要求与容量口径
 
-> 2026-11-16：以下 G5 旧公式只保留为草稿静态下限。正式底座另须通过 `check_prompt_capacity.py`：至少 36 个真实下游领域/类型/H1/H2/H3 v2 题位，且 12 个可用模式各 3 条；CRUD 页数与源码行数不能替代。详见 [capacity-design.md](capacity-design.md) 和 [prompt-opportunities.md](prompt-opportunities.md)。
+> 2026-11-17：以下 G5 旧公式只保留为草稿静态下限。正式底座另须通过 `check_prompt_capacity.py`：至少 36 个真实下游领域/类型/H1/H2/H3 v3 题位，且 12 个可用模式各 3 条。容量材料位于源码仓库外，CRUD 页数与源码行数不能替代。详见 [capacity-design.md](capacity-design.md) 和 [prompt-opportunities.md](prompt-opportunities.md)。
 
 这个 skill 生成的每个仓库都要过 G0～G7 静态闸门与 G8 功能契约前置，全部由 `scripts/verify_repo.py` 机器复核；
 再由 `scripts/probe_startup.py` 做最终干净克隆启动联通检查（不再全量E2E/构建），由 `scripts/check_similarity.py` 做 G9 跨仓库查重。任何一道不过就不算生成完成。
@@ -8,15 +8,15 @@
 | 闸门 | 要求 | 由谁判 |
 |---|---|---|
 | G0 领域 | `.s11-domain.json` 的 domain 为数据工程，subdirection 为三个允许值之一；实际业务方向另须审核 | `verify_repo.py` |
-| G1 结构 | 前端 Vue 或 React、后端 Java 或 Python，双端各有依赖清单与启动入口；纯前端仓库（`frontend/package.json` 里 `repoKind = frontend-only`）不要求后端，但必须有 `frontend/src/api/local-service.ts` 与 `frontend/src/data/*.ts` 本地数据层 | `verify_repo.py` |
+| G1 结构 | 前端 Vue 或 React、后端 Java 或 Python，双端各有依赖清单与启动入口；默认共享`WorkbenchView`和一套资源路由。纯前端不要求后端，但必须有`local-service.ts`、`frontend/src/domain/*.ts`和本地持久化 | `verify_repo.py` |
 | G2 启动 | 前端 dev server 关掉「自动打开页面」 | `verify_repo.py` |
 | G3 忽略 | 根目录 `.gitignore` 覆盖依赖 / 缓存 / 构建产物 / 日志 / 环境文件 | `verify_repo.py` |
-| G4 体量 | 源码行数 >= 2000 行（不含依赖目录、构建产物、锁文件） | `verify_repo.py` |
+| G4 体量 | 源码计行 2000～6000；普通clone文件基线约55、硬上限60；不含依赖、构建物、锁文件和仓外容量材料 | `verify_repo.py` |
 | G5 草稿容量 | 静态公式 >=36，不证明困难题有效容量 | `verify_repo.py` |
 | G6 合规 | 不是禁用题型仓库，无密钥、无超大文件、无违规业务域，且题域不命中 0731 严禁出题清单 | `verify_repo.py` |
 | G7 环境 | 基础环境自洽：Python 全量可编译、后端入口能 import、依赖都声明、没有写死本机路径 | `verify_repo.py` |
 | G8 功能 | 静态逐模块功能契约；一次整体测试/至多一次集中修复后，干净克隆装依赖、起服务、验首页/入口/health/代理；不重复全量E2E或构建；纯前端跳过不存在的后端/代理；进程和临时克隆均清理 | `verify_repo.py` + `probe_startup.py` |
-| G10 困难容量 | >=36 个当前下游语义题位；12 模式各 3 条；领域/类型/H1/H2/H3 v2 及业务源码证据 | `check_prompt_capacity.py`，publisher 每次正式发布前复核 |
+| G10 困难容量 | >=36 个当前下游语义题位；12 模式各 3 条；领域/类型/H1/H2/H3 v3及业务源码证据；仓外map直接绑定最终HEAD | `check_prompt_capacity.py`，publisher 每次正式发布前复核 |
 | G9 差异 | 整批 spec 与历史业务指纹预检，生成后再比较规范化业务源码；相同或超过相似度阈值的仓库拒绝交付 | `check_similarity.py` |
 
 ## G7 基础环境自洽（专治「本地能跑、换台机器就炸」）
@@ -129,9 +129,8 @@ token 只以一次性 `git -c http.extraHeader=...` 传参，**不写进 `.git/c
 
 机器判据（`check_forbidden`）：
 
-- 前端页面组件少于 8 个 → 判「可独立出题的页面太少」；有后端的仓库，后端接口文件少于 8 个
-  也一并判「可独立出题的接口太少」。只有文档、只有算法片段、只有一个入口文件的仓库都会被这一条拦下。
-  纯前端仓库只看页面这一条（`check_forbidden` 只在真的有 backend 目录时才数接口文件）。
+- compact布局必须有一个共享`WorkbenchView`且spec模块>=8；全栈Python/Java必须有>=8个独立领域Service。
+  只有文档、只有算法片段、把全部业务塞进一个通用文件的仓库都会被拦下。
 - 命中密钥特征（私钥、`AKIA...`、`ghp_...`、`sk-...`、硬编码口令）→ 拦下。
 - 命中违规业务域（赌博、色情、毒品、枪支、金融黑灰产、攻击工具）→ 拦下。
 - 单个文件超过 5MB → 拦下（产物快照会被判 too large）。
@@ -159,7 +158,7 @@ token 只以一次性 `git -c http.extraHeader=...` 传参，**不写进 `.git/c
 实践建议 20～24 个真实 topic；实际主体数、静态容量和下游困难题位必须分别复核。
 
 静态公式通过不等于可交付：正式容量还要由 `check_prompt_capacity.py` 证明 36 条计划
-恰好覆盖 12 个可用模式且每个模式 3 条，并逐条通过领域、类型、H1/H2/H3 v2 与源码锚点检查。
+恰好覆盖 12 个可用模式且每个模式 3 条，并逐条通过领域、类型、H1/H2/H3 v3与源码锚点检查。
 降级到 35 条、减少模式或降低每模式上限都不算完成。
 
 ### 主体是什么
@@ -175,8 +174,10 @@ token 只以一次性 `git -c http.extraHeader=...` 传参，**不写进 `.git/c
   纯英文代码派不出主体。
 - 依赖目录、构建产物目录一律不参与派生。
 
-所以默认 spec 的每个模块都会同时产出前端页面、后端接口、业务规则三处代码，
-并且三处都带模块自己的中文业务词。主体数由实际源码派生，不预先承诺固定数量。
+compact布局不再为每个模块复制页面/路由，但全栈仓库仍为每个模块生成独立
+`backend/app/services/<key>.py`（Java为`<Class>Service.java`）；纯前端为每个模块生成
+`frontend/src/domain/<key>.ts`。这些文件承载各自业务字段、状态、动作和数据快照逻辑，
+共同保留18个可独立修改主体，因此缩仓不以降低36题位容量为代价。
 
 ## 规则同步
 
@@ -214,7 +215,7 @@ s11 的分析领域例外会与旧技能形成预期差异；不要把这三项�
   且不出现在 `git status --porcelain` 里——这条会被 `git check-ignore` 实测。
 - 根目录带 `docker-compose.yml`（含 `services`）、`README.md`、`Makefile`，
   方便下游按「已容器化，可一键起环境」判定环境可复现等级。
-- **模块 key 不能和依赖 / 构建产物目录撞名**：key 会变成 `frontend/src/views/<key>/`，
+- **模块 key 不能和依赖 / 构建产物目录撞名**：key 会变成领域服务文件名和前端领域模块名，
   而 `.gitignore` 里有 `dist/`、`build/`、`out/`、`target/`、`**/target/`、`coverage/`、
   `logs/`、`node_modules/` 这些规则。撞名的后果是页面被 git 忽略：本地静态验收全绿、
   干净克隆里少一个页面、前端构建报 `TS2307: Cannot find module '@/views/<key>/index.vue'`。
@@ -239,6 +240,7 @@ s11 的分析领域例外会与旧技能形成预期差异；不要把这三项�
 就能悄悄通过 G1，闸门等于失效——`tests/test_gates.py` 里有专门的反例用例守着这条。
 
 React 变体还有一条主体派生的坑：上游口径会跳过 `index.tsx` / `index.ts` / `main.tsx` 这类入口文件名，
-所以纯前端 React 的页面组件落在 `src/views/<key>/<Key>View.tsx`，`index.tsx` 只写一行
+所以纯前端 React 的共享工作台保留在 `src/views/WorkbenchView.tsx`；每个业务主体落在
+`src/domain/<key>.ts`，不再为每个模块生成独立页面组件。
 `export { default } from './<Key>View'`（标准 barrel）。否则 18 个页面一个主体都派生不出来，
 容量会掉到 16 条。

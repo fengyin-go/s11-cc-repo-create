@@ -62,7 +62,7 @@ Java 版的 G8 一律按未验证处理，不能写成已通过。
      --skip-probe  # 仅生成草稿；增强业务/题位后用 --prepared-repo --publish 验收发布
    ```
 
-3. **真启动探针会联网**：`probe_startup.py` 会用锁文件执行 `npm ci`、安装 Python 锁定依赖并准备 Playwright Chromium，需要 npm registry、PyPI 与浏览器下载源可达。
+3. **真启动探针会联网**：默认startup会按锁文件执行`npm ci`并安装Python锁定依赖，需要npm registry与PyPI可达。只有显式`--profile full`才检查/安装Playwright Chromium。
 
 4. **探针日志**默认落在「被验仓库的父目录」下的 `.probe-logs/<仓库名>/`。
 

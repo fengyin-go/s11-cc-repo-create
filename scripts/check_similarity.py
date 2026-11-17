@@ -127,12 +127,24 @@ def compare_specs(left: dict, right: dict) -> dict[str, float | bool]:
 
 def _business_sources(repo: Path) -> list[str]:
     files: list[Path] = []
-    for pattern in (
-        "frontend/src/views/**/*.vue", "frontend/src/views/**/*.tsx",
-        "backend/app/routers/*.py", "backend/app/services/*.py",
-        "backend/src/main/java/**/*Controller.java", "backend/src/main/java/**/*Service.java",
-    ):
-        files.extend(path for path in repo.glob(pattern) if path.is_file())
+    compact = any((repo / path).is_file() for path in (
+        "frontend/src/views/WorkbenchView.vue",
+        "frontend/src/views/WorkbenchView.tsx",
+    ))
+    patterns = (
+        ("frontend/src/domain/*.ts", "backend/app/services/*.py",
+         "backend/src/main/java/**/*Service.java")
+        if compact else
+        ("frontend/src/views/**/*.vue", "frontend/src/views/**/*.tsx",
+         "backend/app/routers/*.py", "backend/app/services/*.py",
+         "backend/src/main/java/**/*Controller.java",
+         "backend/src/main/java/**/*Service.java")
+    )
+    for pattern in patterns:
+        files.extend(
+            path for path in repo.glob(pattern)
+            if path.is_file() and path.name not in {"base.py", "__init__.py"}
+        )
     # 文件名含模块 key，不应影响只换 key 的对比；按规范化内容而不是路径排序。
     normalized = []
     for path in files:

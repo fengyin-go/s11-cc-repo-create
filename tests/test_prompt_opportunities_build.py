@@ -45,7 +45,7 @@ class OpportunityBuilderTest(unittest.TestCase):
         self.map_path.write_text(json.dumps({
             "version": 1,
             "profile": "gsb-semantic-v2",
-            "difficulty_contract_version": 2,
+            "difficulty_contract_version": 3,
             "type_policy": "capacity-first",
             "domain": "数据工程",
             "subdirection": "数据分析与数据应用",
@@ -146,6 +146,18 @@ class OpportunityBuilderTest(unittest.TestCase):
         self.assertEqual(payload["reserve_mode_counts"],
                          {mode: 1 for mode in repo_rules.USABLE_MODES})
         self.assertFalse((self.repo / "prompt-opportunities").exists())
+
+    def test_builder_uses_container_external_topic_map(self):
+        external = self.repo.parent / ".s11-meta/repo-topic-map.json"
+        external.parent.mkdir()
+        external.write_text(self.map_path.read_text(encoding="utf-8"), encoding="utf-8")
+        self.map_path.unlink()
+        out = self.root / "prompt-opportunities/repo.json"
+        with patch.object(builder.check_prompt_capacity, "check_capacity",
+                          return_value=self.capacity_report()), patch.object(
+                builder, "_repo_head", return_value="b" * 40):
+            result = builder.build(self.repo, self.briefs_path, out, map_path=external)
+        self.assertTrue(result["ok"], result)
 
     def test_existing_map_is_revalidated_without_rewriting(self):
         out = self.root / "prompt-opportunities/repo.json"

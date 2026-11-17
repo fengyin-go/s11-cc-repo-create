@@ -91,10 +91,12 @@ class CapacityFixture:
             plan['difficulty_design']['module_anchors'] = [
                 {**a, 'supports': 'primary' if i == 0 else 'secondary'}
                 for i, a in enumerate(plan['support_evidence'])]
-        return {'version': 1, 'profile': 'gsb-semantic-v2', 'type_policy': 'capacity-first',
-            'difficulty_contract_version': 2, 'base_commit': self.base, 'domain': '数据工程',
+        payload = {'version': 1, 'profile': 'gsb-semantic-v2', 'type_policy': 'capacity-first',
+            'difficulty_contract_version': 3, 'base_commit': self.base, 'domain': '数据工程',
             'subdirection': '数据分析与数据应用', 'max_capacity': count,
             'topics': topics, 'task_plan': plans}
+        capacity.topic_map_v3.normalize_map(payload)
+        return payload
 
     def save_map(self, commit=True):
         self.map_path.parent.mkdir(exist_ok=True)
@@ -200,6 +202,46 @@ class CapacityTest(CapacityFixture, unittest.TestCase):
         self.assertIn('--require-difficulty-design', command)
         self.assertEqual(command[command.index('--expected-base-commit') + 1], self.base)
         self.assertEqual(self.git('status', '--porcelain'), '')
+
+    def test_external_capacity_map_binds_directly_to_final_head_without_metadata_commit(self):
+        external = self.repo.parent / '.s11-meta/repo-topic-map.json'
+        external.parent.mkdir()
+        self.payload['base_commit'] = self.head
+        self.payload['difficulty_contract_version'] = 2
+        plan = self.payload['task_plan'][0]
+        design = plan['difficulty_design']
+        design['version'] = 2
+        design.pop('workload_design', None)
+        design['reasoning_challenge'] = {'constraints': [
+            {'kind': 'transaction_consistency', 'statement': '订单数据与来源批次必须同时可见'},
+            {'kind': 'failure_recovery', 'statement': '恢复时不能覆盖上一份完整订单数据'},
+        ]}
+        design['design_tradeoff'] = {
+            'decision': '迟到数据按业务时间还是采集时间恢复',
+            'options': ['按业务时间恢复', '按采集时间恢复'],
+        }
+        external.write_text(
+            json.dumps(self.payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        self.base = self.head
+        with self.mocks():
+            report = self.check()
+        self.assertTrue(report['ok'], report['issues'])
+        self.assertEqual(report['metadata_location'], 'external-container')
+        self.assertEqual(report['source_base_commit'], self.head)
+        self.assertEqual(report['baseline_to_head_paths'], [])
+        self.assertEqual(report['map'], str(external))
+        self.assertTrue(report['map_schema_upgraded'])
+        upgraded = json.loads(external.read_text(encoding='utf-8'))
+        self.assertEqual(upgraded['difficulty_contract_version'], 3)
+        self.assertEqual(upgraded['task_plan'][0]['difficulty_design']['version'], 3)
+        self.assertIn('workload_design', upgraded['task_plan'][0]['difficulty_design'])
+        self.assertEqual(
+            [item['id'] for item in upgraded['task_plan'][0]['difficulty_design']
+             ['reasoning_challenge']['constraints']],
+            ['C1', 'C2'])
+        self.assertEqual(
+            upgraded['task_plan'][0]['difficulty_design']['design_tradeoff']['decision_axis'],
+            'effective_time')
 
     def test_committed_map_only_followups_are_allowed(self):
         (self.map_path.parent / 'notes.json').write_text('{"audit":"capacity metadata"}\n')
@@ -622,16 +664,54 @@ class RealDownstreamNegativeTest(CapacityFixture, unittest.TestCase):
         design = plan['difficulty_design']
         design.update(reasoning_challenge={
             'constraints': [
-                {'kind': 'transaction_consistency', 'statement': '订单数据与来源批次必须同时可见',
+                {'id': 'C1', 'kind': 'transaction_consistency', 'statement': '订单数据与来源批次必须同时可见',
                  'failure_if_omitted': '下游会读到没有来源的明细'},
-                {'kind': 'failure_recovery', 'statement': '中断后只补写缺失记录，不能覆盖完整版本',
+                {'id': 'C2', 'kind': 'failure_recovery', 'statement': '中断后只补写缺失记录，不能覆盖完整版本',
                  'failure_if_omitted': '重试会回退已经可用的数据结果'}],
             'why_interact': '恢复位置由已可见批次决定，写入范围又决定下游读取版本。',
             'prompt_excerpt': '中断后保留上一份完整订单数据集，重试只补写缺失记录。'},
             design_tradeoff={'decision': '恢复边界按采集时间还是业务时间确定',
+                'decision_axis': 'effective_time',
+                'trigger': '迟到订单与历史更正落在已发布窗口',
                 'options': ['按采集时间恢复', '按业务时间恢复'],
                 'outcome_invariant': '恢复完成下游只能看到完整订单数据集',
                 'why_open': '两种边界都可行，题面只固定可观察结果，不选择内部键。',
+                'context_excerpt': '迟到订单与历史更正落在已发布窗口，恢复边界会改变补算范围。',
+                'context_anchors': [
+                    {'path': 'src/orders.py', 'start_line': 2, 'end_line': 2,
+                     'supports': 'trigger', 'excerpt': PRODUCER.splitlines()[1]},
+                    {'path': 'src/exports.py', 'start_line': 2, 'end_line': 2,
+                     'supports': 'option_a', 'excerpt': CONSUMER.splitlines()[1]},
+                    {'path': 'src/exports.py', 'start_line': 2, 'end_line': 2,
+                     'supports': 'option_b', 'excerpt': CONSUMER.splitlines()[1]},
+                ],
+                'option_analysis': [
+                    {'option': '按采集时间恢复',
+                     'benefit': '按采集顺序恢复可以缩小扫描范围',
+                     'cost': '迟到更正需要独立补算受影响业务窗口',
+                     'viable_when': '采集顺序可靠且存在迟到记录补偿机制',
+                     'preserves_constraint_ids': ['C1', 'C2'],
+                     'correctness_effect': '按采集顺序推进会缩小扫描范围，但迟到更正必须独立补偿',
+                     'observable_result': '恢复文件按采集顺序生成，并附迟到业务窗口清单'},
+                    {'option': '按业务时间恢复',
+                     'benefit': '按业务窗口重算可以直接核对历史完整性',
+                     'cost': '历史窗口重新扫描会增加去重与计算成本',
+                     'viable_when': '业务时间可靠且可以承担历史窗口重算成本',
+                     'preserves_constraint_ids': ['C1', 'C2'],
+                     'correctness_effect': '按业务窗口重算会扩大扫描范围，但能直接校正历史口径',
+                     'observable_result': '恢复文件包含受影响业务窗口并保留同一来源批次'},
+                ],
+                'both_options_valid': True,
+                'choice_changes_correctness': True,
+                'prompt_keeps_choice_open': True,
+                'fixed_branch_excluded': True,
+                'false_h3_guards': {name: False for name in (
+                    'one_branch_violates_constraints', 'fixed_resolution_in_prompt',
+                    'implementation_only', 'retry_or_error_message_only', 'display_only',
+                    'single_result_invariant_only', 'source_selection_only',
+                    'equivalent_user_outcome')},
+                'false_h3_counterexample': '先规定迟到更正必须按业务时间，再要求设计者选择恢复边界',
+                'decision_impact': '时间轴选择影响恢复扫描范围与迟到更正的数据完整性',
                 'implementation_not_prescribed': True,
                 'prompt_excerpt': '请自行选择恢复边界采用哪种时间，保证下游结果完整。'},
             medium_counterexample={'generic_task': '给订单列表增加导出按钮并保持列表和详情一致',
@@ -642,6 +722,8 @@ class RealDownstreamNegativeTest(CapacityFixture, unittest.TestCase):
                 'example_data_only', 'cross_call_merge_only')},
             module_anchors=[{**a, 'supports': 'primary' if i == 0 else 'secondary'}
                             for i, a in enumerate(plan['support_evidence'])])
+        design['version'] = 3
+        design['workload_design'] = capacity.topic_map_v3.derive_workload_design(plan)
         design['module_integration']['prompt_excerpt'] = '分析导出中心必须读取同一份订单数据集并保留来源批次。'
         self.save_map()
 
@@ -659,6 +741,12 @@ class RealDownstreamNegativeTest(CapacityFixture, unittest.TestCase):
         self.save_map()
         with self.assertRaisesRegex(capacity.CapacityError, '只支持 version=1'):
             capacity._json_process(self.validator_command(), self.repo)
+
+    def test_real_validator_accepts_current_v3_contract(self):
+        self.real_payload()
+        report = self.real_check()
+        self.assertTrue(report['ok'], report['issues'])
+        self.assertEqual(report['qualified_plan_count'], 1)
 
     def test_real_validator_rejects_display_only_H2(self):
         self.real_payload()

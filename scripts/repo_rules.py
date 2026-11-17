@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from typing import Iterable
 
-GATE_VERSION = "s11-cc-repo-create-2026-11-16-prompt-opportunities-v2"
+GATE_VERSION = "s11-cc-repo-create-2026-11-17-compact-layout-v2-v3-contract"
 
 # ---------------------------------------------------------------------------
 # 源码扫描模式：只有命中这些模式的文件才会被当成「可独立出题的主体」。
@@ -239,6 +239,24 @@ MAX_PER_SUBJECT = 2
 MAX_PER_MODE = 3
 # 本 skill 的正式容量目标：一个仓库必须能出 36 条。
 MIN_CAPACITY = 36
+# 紧凑布局防止通过复制CRUD页面和路由制造虚假体量；18个独立领域服务仍保留。
+MAX_CODE_LINES = 6000
+MAX_REPO_FILES = 60
+EXTERNAL_META_DIRNAME = ".s11-meta"
+
+
+def external_meta_dir(repo: Path | str) -> Path:
+    """容量设计材料目录：位于任务容器内，但绝不提交进源码仓库。"""
+    return Path(repo).resolve().parent / EXTERNAL_META_DIRNAME
+
+
+def topic_map_path(repo: Path | str) -> Path:
+    """优先使用仓外权威map；旧仓库回退到仓库内 `.s11-capacity`。"""
+    repo = Path(repo).resolve()
+    external = external_meta_dir(repo) / "repo-topic-map.json"
+    if external.is_file():
+        return external
+    return repo / ".s11-capacity" / "repo-topic-map.json"
 
 # 提示词机会地图默认写在生成仓库外。
 PROMPT_OPPORTUNITY_DIRNAME = "prompt-opportunities"

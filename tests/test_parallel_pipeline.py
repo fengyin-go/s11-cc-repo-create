@@ -157,14 +157,18 @@ class ParallelPipelineTests(unittest.TestCase):
                                     "modules": [{"key": "mock"}]}))
         return path
 
-    def prepared(self, number, *, has_map=True):
+    def prepared(self, number, *, has_map=True, external_map=False):
         root = self.parent / f"cc{10000 + number}" / f"cc{10000 + number}"
         root.mkdir(parents=True)
         (root / pipeline.SPEC_FILE).write_text(self.spec(number).read_text())
         (root / ".git").mkdir()
         if has_map:
-            (root / ".s11-capacity").mkdir()
-            (root / ".s11-capacity/repo-topic-map.json").write_text('{"topics": ["mock"]}')
+            map_path = (
+                root.parent / ".s11-meta/repo-topic-map.json"
+                if external_map else root / ".s11-capacity/repo-topic-map.json"
+            )
+            map_path.parent.mkdir()
+            map_path.write_text('{"topics": ["mock"]}')
         (root.parent / "prompt-opportunity-briefs.json").write_text(
             '{"opportunities": []}', encoding="utf-8")
         return root
@@ -225,6 +229,16 @@ class ParallelPipelineTests(unittest.TestCase):
         self.assertEqual(self.children.maximum["heavy"], 1)
         self.assertEqual(self.children.maximum["推送 GitHub"], 2)
         self.assertEqual(self.children.count("生成"), 0)
+
+    def test_prepared_repo_uses_external_capacity_map(self):
+        repo = self.prepared(41, has_map=True, external_map=True)
+        records, _ = pipeline.run_batch([repo], self.args(prepared_repo=[repo]))
+        self.assertTrue(records[0]["ok"], records)
+        capacity_cmd = next(
+            cmd for step, cmd in self.children.calls if step == "出题容量验收")
+        map_arg = capacity_cmd[capacity_cmd.index("--map") + 1]
+        self.assertEqual(
+            Path(map_arg), repo.parent / ".s11-meta/repo-topic-map.json")
 
     def test_final_pipeline_dispatches_only_startup_not_full_tests(self):
         repo = self.prepared(42)

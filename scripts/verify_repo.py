@@ -124,6 +124,34 @@ def count_code_lines(repo: Path) -> dict[str, object]:
     }
 
 
+def count_repository_files(repo: Path) -> int:
+    """统计会随普通 clone 进入工作树的文件，排除依赖、构建物和 Git 元数据。"""
+    ignored = set(rules.SCAN_IGNORED_DIR_PARTS)
+    return sum(
+        1 for path in repo.rglob("*")
+        if path.is_file() and not (set(path.relative_to(repo).parts[:-1]) & ignored)
+    )
+
+
+def check_size_budget(repo: Path, code_size: dict[str, object], *, max_lines: int,
+                      max_files: int) -> dict[str, object]:
+    problems: list[str] = []
+    code_lines = int(code_size["code_lines"])
+    repo_files = count_repository_files(repo)
+    if code_lines > max_lines:
+        problems.append(f"代码计行 {code_lines} > 紧凑上限 {max_lines}")
+    if repo_files > max_files:
+        problems.append(f"仓库文件 {repo_files} > 紧凑上限 {max_files}")
+    return {
+        "ok": not problems,
+        "problems": problems,
+        "code_lines": code_lines,
+        "repo_files": repo_files,
+        "max_code_lines": max_lines,
+        "max_repo_files": max_files,
+    }
+
+
 def detect_repo_kind(repo: Path) -> str:
     """仓库形态：读前端 package.json 里的 repoKind，缺省当全栈。
 
@@ -259,7 +287,12 @@ def check_runnable_entries(repo: Path, structure: dict[str, object]) -> dict[str
             if not application:
                 problems.append("Java 后端找不到 @SpringBootApplication 入口")
             controllers = list(backend_dir.rglob("*Controller.java"))
-            if len(controllers) < 3:
+            services = [
+                p for p in backend_dir.rglob("*Service.java")
+                if p.name not in {"ModuleService.java", "OverviewService.java", "ResourceService.java"}
+            ]
+            compact_resource = any(p.name == "ResourceController.java" for p in controllers)
+            if (not compact_resource and len(controllers) < 3) or len(services) < 8:
                 problems.append(f"Java 后端只有 {len(controllers)} 个 Controller，撑不起多主体出题")
     return {"ok": not problems, "problems": problems, "evidence": evidence}
 
@@ -423,20 +456,40 @@ def check_forbidden(repo: Path, structure: dict[str, object]) -> dict[str, objec
     # 纯前端仓库只看页面数；有后端的仓库接口文件也要够。
     if structure["frontend_dir"]:
         frontend_dir = repo / str(structure["frontend_dir"])
+        compact_frontend = any(
+            (frontend_dir / "src/views" / name).is_file()
+            for name in ("WorkbenchView.vue", "WorkbenchView.tsx")
+        )
+        spec_modules: list[object] = []
+        try:
+            spec_modules = json.loads(
+                (repo / ".s11-spec.json").read_text(encoding="utf-8"))["modules"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            pass
         views = [p for p in frontend_dir.rglob("index.*") if p.suffix in {".vue", ".tsx", ".jsx"}]
-        if len(views) < 8:
+        if not compact_frontend and len(views) < 8:
             problems.append(
                 f"可独立出题的页面太少（页面 {len(views)} 个）："
                 "仓库会退化成只能出代码理解类题，必须补齐业务模块")
+        if compact_frontend and len(spec_modules) < 8:
+            problems.append(
+                f"紧凑工作台背后的业务模块太少（{len(spec_modules)} 个）：至少保留8个真实模块")
         backend_name = str(structure.get("backend_dir") or "")
         if backend_name:
             backend_dir = repo / backend_name
-            routers = [p for p in (backend_dir / "app" / "routers").glob("*.py")] if (
-                backend_dir / "app" / "routers").is_dir() else list(backend_dir.rglob("*Controller.java"))
-            if len(routers) < 8:
+            python_services = [
+                p for p in (backend_dir / "app/services").glob("*.py")
+                if p.name not in {"__init__.py", "base.py"}
+            ] if (backend_dir / "app/services").is_dir() else []
+            java_services = [
+                p for p in backend_dir.rglob("*Service.java")
+                if p.name not in {"ModuleService.java", "OverviewService.java", "ResourceService.java"}
+            ]
+            subjects = python_services or java_services
+            if len(subjects) < 8:
                 problems.append(
-                    f"可独立出题的接口太少（接口文件 {len(routers)} 个）："
-                    "仓库会退化成只能出代码理解类题，必须补齐业务模块")
+                    f"可独立修改的领域服务太少（{len(subjects)} 个）："
+                    "必须保留至少8个真实业务服务，不能把全部业务压进一个通用文件")
     return {
         "ok": not problems,
         "problems": problems,
@@ -797,78 +850,72 @@ def check_functional_contract(repo: Path, structure: dict[str, object], kind: st
         return {"ok": False, "problems": ["缺少合法的 .s11-spec.json，无法核对功能覆盖"]}
     frontend_name = str(structure.get("frontend_dir") or "frontend")
     frontend = repo / frontend_name
-    for relative in ("playwright.config.ts", "tests/functionality.spec.ts", "package-lock.json"):
+    compact_vue = frontend / "src/views/WorkbenchView.vue"
+    compact_react = frontend / "src/views/WorkbenchView.tsx"
+    compact_frontend = compact_vue if structure.get("frontend_stack") == "vue" else compact_react
+    compact_layout = compact_frontend.is_file()
+    for relative in ("package-lock.json",):
         if not (frontend / relative).is_file():
-            problems.append(f"缺少功能验收/依赖复现资产 frontend/{relative}")
+            problems.append(f"缺少依赖复现资产 frontend/{relative}")
     try:
         package = json.loads((frontend / "package.json").read_text(encoding="utf-8"))
-        if "test:e2e" not in package.get("scripts", {}):
-            problems.append("frontend/package.json 缺少 test:e2e")
-        if "@playwright/test" not in package.get("devDependencies", {}):
-            problems.append("frontend/package.json 缺少 @playwright/test")
+        if compact_layout and "@playwright/test" in package.get("devDependencies", {}):
+            problems.append("紧凑布局不应携带 @playwright/test；最终只做启动联通")
     except (OSError, json.JSONDecodeError):
         problems.append("无法读取 frontend/package.json")
 
     for overview in (frontend / "src/views/Overview.vue", frontend / "src/views/Overview.tsx"):
         if overview.is_file() and "showCreate" in overview.read_text(encoding="utf-8"):
             problems.append("概览页误含模块登记弹窗状态")
+    if compact_layout:
+        compact_text = compact_frontend.read_text(encoding="utf-8", errors="replace")
+        for marker in ("data-testid=", "openCreate", "submitCreate", "runAction"):
+            if marker not in compact_text:
+                problems.append(f"共享工作台缺少功能契约标记 {marker}")
+        if len(compact_text.splitlines()) > 320:
+            problems.append("共享工作台超过320行，说明共享表现层再次膨胀")
+
     for module in modules:
         key = module["key"]
         class_name = "".join(part.capitalize() for part in key.split("_") if part)
-        relative = f"src/views/{key}/index.vue" if structure.get("frontend_stack") == "vue" \
-            else (f"src/views/{key}/{class_name}View.tsx" if kind == "frontend-only"
-                  else f"src/views/{key}/index.tsx")
-        page = frontend / relative
-        if not page.is_file():
-            problems.append(f"模块 {key} 缺少页面 {relative}")
-            continue
-        text = page.read_text(encoding="utf-8", errors="replace")
-        shape = module.get("page_shape", "crud-table")
-        # 纯前端模式下非 crud-table 回退到 crud-table
-        if kind == "frontend-only" and shape != "crud-table":
-            shape = "crud-table"
-        is_vue = structure.get("frontend_stack") == "vue"
-        if is_vue:
-            shape_markers = {
-                "crud-table": ("data-testid=", "openCreate", "submitCreate", "runAction"),
-                "dag-graph": ("data-testid=", "openCreate", "submitCreate", "runAction", "selectNode"),
-                "job-timeline": ("data-testid=", "openCreate", "submitCreate", "selectItem"),
-                "analysis-dashboard": ("data-testid=", "runAnalysis", "fetchSummary"),
-            }
-        else:
-            # React 模板保持统一的 crud-table 形态
-            shape_markers = {"crud-table": ("data-testid=", "openCreate", "submitCreate", "runAction")}
-        for marker in shape_markers.get(shape, shape_markers["crud-table"]):
-            if marker not in text:
-                problems.append(f"模块 {key} ({'Vue ' if is_vue else 'React '}{shape}) 页面缺少 {marker}")
-        if "尚未接入" in text:
-            problems.append(f"模块 {key} 仍含占位功能")
+        if not compact_layout:
+            relative = f"src/views/{key}/index.vue" if structure.get("frontend_stack") == "vue" \
+                else f"src/views/{key}/index.tsx"
+            page = frontend / relative
+            if not page.is_file():
+                problems.append(f"旧布局模块 {key} 缺少页面 {relative}")
+            else:
+                text = page.read_text(encoding="utf-8", errors="replace")
+                if "尚未接入" in text:
+                    problems.append(f"模块 {key} 仍含占位功能")
         if kind == "fullstack" and structure.get("backend_stack") == "python":
-            router_path = repo / str(structure.get("backend_dir")) / "app/routers" / f"{key}.py"
-            router = router_path.read_text(encoding="utf-8", errors="replace") if router_path.is_file() else ""
-            shape = module.get("page_shape", "crud-table")
-            if shape == "crud-table":
-                if "payload: ActionPayload" not in router or "filters=query_filters(request)" not in router:
-                    problems.append(f"模块 {key} Python 动作/查询契约不完整")
-            elif shape in ("dag-graph", "job-timeline", "analysis-dashboard"):
-                if "ActionPayload" not in router:
-                    problems.append(f"模块 {key} ({shape}) Python 动作契约不完整")
-            # /export ordering check
-            export_position = router.find('@router.get("/export")')
-            detail_position = router.find('@router.get("/{entry_id}"')
-            action_position = router.find('@router.post("/{entry_id}/actions")')
-            if not action_position and "run_action" in router:
-                action_position = router.rfind('"/{entry_id}')
-            if export_position < 0 or detail_position < 0 or export_position > detail_position:
-                if shape == "crud-table" or not action_position or export_position < action_position:
-                    pass
-                else:
-                    problems.append(f"模块 {key} 的 /export 仍可能被 /{{entry_id}} 截获")
+            service_path = (
+                repo / str(structure.get("backend_dir")) / "app/services" / f"{key}.py")
+            if not service_path.is_file():
+                problems.append(f"模块 {key} 缺少独立领域服务 app/services/{key}.py")
         elif kind == "fullstack" and structure.get("backend_stack") == "java":
-            controller = list((repo / str(structure.get("backend_dir"))).rglob(f"{class_name}Controller.java"))
-            text_java = controller[0].read_text(encoding="utf-8") if controller else ""
-            if "ResponseEntity<byte[]> export" not in text_java or "filters(params)" not in text_java:
-                problems.append(f"模块 {key} Java 查询/CSV 导出契约不完整")
+            service_file = list(
+                (repo / str(structure.get("backend_dir"))).rglob(f"{class_name}Service.java"))
+            if not service_file:
+                problems.append(f"模块 {key} 缺少独立 Java 领域 Service")
+
+    if kind == "fullstack" and structure.get("backend_stack") == "python":
+        backend = repo / str(structure.get("backend_dir"))
+        resource = backend / "app/routers/resource.py"
+        base_service = backend / "app/services/base.py"
+        if compact_layout and (not resource.is_file() or not base_service.is_file()):
+            problems.append("Python 紧凑后端缺少共享资源路由或服务基类")
+        else:
+            router_text = resource.read_text(encoding="utf-8", errors="replace")
+            for marker in ('@router.get("/{module}/export"',
+                           '@router.get("/{module}/{entry_id}"',
+                           '@router.post("/{module}/{entry_id}/actions"'):
+                if marker not in router_text:
+                    problems.append(f"共享资源路由缺少契约 {marker}")
+    elif kind == "fullstack" and structure.get("backend_stack") == "java":
+        backend = repo / str(structure.get("backend_dir"))
+        if compact_layout and not list(backend.rglob("ResourceController.java")):
+            problems.append("Java 紧凑后端缺少共享 ResourceController")
 
     if kind == "frontend-only":
         service = frontend / "src/api/local-service.ts"
@@ -884,7 +931,9 @@ def check_functional_contract(repo: Path, structure: dict[str, object], kind: st
 
 
 def verify(repo: Path, *, min_lines: int, min_capacity: int, per_mode: int,
-           per_subject: int, kind: str = "auto") -> dict[str, object]:
+           per_subject: int, max_lines: int = rules.MAX_CODE_LINES,
+           max_files: int = rules.MAX_REPO_FILES,
+           kind: str = "auto") -> dict[str, object]:
     resolved_kind = detect_repo_kind(repo) if kind == "auto" else kind
     checks: dict[str, object] = {}
     checks["domain"] = domain_rules.check_repo(repo)
@@ -893,6 +942,16 @@ def verify(repo: Path, *, min_lines: int, min_capacity: int, per_mode: int,
     checks["auto_open"] = check_auto_open(repo)
     checks["gitignore"] = check_gitignore(repo)
     checks["code_size"] = count_code_lines(repo)
+    compact_layout = any((repo / path).is_file() for path in (
+        "frontend/src/views/WorkbenchView.vue",
+        "frontend/src/views/WorkbenchView.tsx",
+    ))
+    checks["size_budget"] = check_size_budget(
+        repo, checks["code_size"],
+        max_lines=max_lines if compact_layout else max(max_lines, 30000),
+        max_files=max_files if compact_layout else max(max_files, 150),
+    )
+    checks["size_budget"]["layout"] = "compact" if compact_layout else "legacy"
     checks["capacity"] = check_capacity(repo, min_capacity=min_capacity,
                                         per_mode=per_mode, per_subject=per_subject)
     checks["env_preconditions"] = check_env_preconditions(repo, checks["structure"])
@@ -909,6 +968,7 @@ def verify(repo: Path, *, min_lines: int, min_capacity: int, per_mode: int,
         "runnable_entries": "G1 启动入口",
         "auto_open": "G2 自动打开页面",
         "gitignore": "G3 .gitignore",
+        "size_budget": "G4 紧凑仓库体积",
         "capacity": "G5 出题容量",
         "compliance": "G6 内容合规",
         "env_preconditions": "G7 基础环境自洽",
@@ -931,6 +991,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="验收代码仓库是否满足本 skill 的硬性要求")
     parser.add_argument("--repo", help="要验收的仓库目录")
     parser.add_argument("--min-lines", type=int, default=2000, help="源码行数下限，默认 2000")
+    parser.add_argument("--max-lines", type=int, default=rules.MAX_CODE_LINES,
+                        help=f"紧凑仓库代码行上限，默认 {rules.MAX_CODE_LINES}")
+    parser.add_argument("--max-files", type=int, default=rules.MAX_REPO_FILES,
+                        help=f"紧凑仓库文件数上限，默认 {rules.MAX_REPO_FILES}")
     parser.add_argument("--min-capacity", type=int, default=rules.MIN_CAPACITY,
                         help=f"出题容量下限，默认 {rules.MIN_CAPACITY}")
     parser.add_argument("--per-mode", type=int, default=rules.MAX_PER_MODE,
@@ -963,8 +1027,10 @@ def main() -> int:
         print(json.dumps({"ok": False, "failures": [f"仓库目录不存在：{repo}"]}, ensure_ascii=False))
         return 2
 
-    result = verify(repo, min_lines=args.min_lines, min_capacity=args.min_capacity,
-                    per_mode=args.per_mode, per_subject=args.per_subject, kind=args.kind)
+    result = verify(
+        repo, min_lines=args.min_lines, min_capacity=args.min_capacity,
+        per_mode=args.per_mode, per_subject=args.per_subject,
+        max_lines=args.max_lines, max_files=args.max_files, kind=args.kind)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

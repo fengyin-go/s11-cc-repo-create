@@ -80,7 +80,7 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 
 ## 怎么设计能产 36 道困难题的底座
 
-18 个模块是数学下限，不要只填写更多 CRUD 字段就宣称容量成立。按 [capacity-design.md](capacity-design.md) 设计约 20～24 个真实 topic 和贯通数据流，准备 36 张正式机会卡和 12 张同模式备用卡，实际实现业务后保留至少 36 个合格 H1/H2/H3 v2 题位。提示词机会地图写在生成仓库外，格式见 [prompt-opportunities.md](prompt-opportunities.md)。
+18 个模块仍是容量数学下限，但不再生成18套完整页面。默认compact布局为每个模块保留独立领域服务，前端和后端共享表现/路由基础设施。按 [capacity-design.md](capacity-design.md) 设计约 20～24 个真实 topic 和贯通数据流，准备 36 张正式机会卡和 12 张同模式备用卡，实际实现业务后保留至少 36 个合格 H1/H2/H3 v3 题位。提示词机会地图写在生成仓库外，格式见 [prompt-opportunities.md](prompt-opportunities.md)。
 
 字段/状态/动作使用具体数据语义；既要区分业务对象，也要形成真正的跨模块数据消费。独立页面、文件数、动作按钮数均不是困难题容量证据。请先设计真实输入、加工产物与消费者，再选择CRUD、DAG、时间线等展示形态；不能反过来用展示形态证明真实数据链路。
 
@@ -89,17 +89,18 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 ```text
 <父目录>/<项目编号>/<项目编号>/         例如 cc10001/cc10001、YEL10003/YEL10003
 ├── frontend/                 Vue 3 或 React + Vite + TypeScript
-│   ├── src/views/<key>/index.vue|tsx   每个模块一个页面（主体 = <key>）
+│   ├── src/views/WorkbenchView.vue|tsx  全部模块共享的统一工作台
+│   ├── src/data/modules.ts              18个业务模块配置
+│   ├── src/domain/<key>.ts              纯前端：每个模块独立领域逻辑
 │   ├── src/router/index.ts             React 走 src/App.tsx
 │   ├── src/api/client.ts               统一请求封装
 │   ├── src/stores/session.ts           会话状态（React 版省略）
 │   ├── vite.config.ts                  server.open = false
-│   ├── tests/functionality.spec.ts      首次整体测试可用；最终smoke不运行
-│   ├── playwright.config.ts            Chromium E2E 配置
 │   └── package.json / package-lock.json / index.html / tsconfig.json
 ├── backend/                  FastAPI 或 Spring Boot
-│   ├── app/routers/<key>.py            每个模块一组接口（主体 = <key>）
-│   ├── app/services/<key>.py           状态流转与字段校验
+│   ├── app/routers/resource.py          一套通用查询/导出/登记/动作接口
+│   ├── app/services/base.py             共享服务骨架
+│   ├── app/services/<key>.py            每个模块独立领域逻辑（主体 = <key>）
 │   ├── app/store.py / seed.py          内存仓库与示例数据
 │   └── requirements.txt / run.sh
 ├── .gitignore
@@ -114,9 +115,8 @@ python3 <skill>/scripts/scaffold_repo.py --check-spec --spec /path/to/spec.json
 
 ```text
 ├── frontend/
-│   ├── src/views/<key>/index.vue       每个模块一个页面（Vue：主体 = <key>）
-│   ├── src/views/<key>/<Key>View.tsx   React：组件落在这里（主体 = <Key>View）
-│   ├── src/views/<key>/index.tsx       React：只写一行 re-export（barrel）
+│   ├── src/views/WorkbenchView.vue|tsx 全部模块共享的统一工作台
+│   ├── src/domain/<key>.ts             每个模块独立数据计算/状态逻辑（主体 = <key>）
 │   ├── src/api/local-service.ts        列表 / 筛选 / 动作流转 / 导出 / 概览
 │   ├── src/data/modules.ts             模块元数据：字段、状态、动作、流转目标
 │   ├── src/data/seed.ts                示例数据（每模块三行）

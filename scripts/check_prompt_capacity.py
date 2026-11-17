@@ -9,12 +9,14 @@ S11_PROMPT_SKILL overrides the downstream default, including at call time.
 No cache, network, Git writes, prompt generation, or business-source execution
 is used. CLI exits 0 for the requested target, 1 on rejection/unavailable tools.
 
-Map: version=1, profile=gsb-semantic-v2, difficulty_contract_version=2,
-explicit type_policy=capacity-first, base_commit=S (full source-baseline SHA).
-Commit source baseline S first, then commit only JSON metadata under
-.s11-capacity/ to HEAD H. Require S to be an ancestor of H and git diff S..H
-to contain ONLY non-executable regular *.json metadata under .s11-capacity/. Pass S to the downstream --expected-base-commit; source_head=H
-and source_base_commit=S. Both commits and the clean worktree are fingerprinted.
+Map: version=1, profile=gsb-semantic-v2, difficulty_contract_version=3,
+explicit type_policy=capacity-first. New compact repositories keep the map at
+<container>/.s11-meta/repo-topic-map.json outside Git and set base_commit to
+the final clean source HEAD. Anchors are verified against that HEAD without a
+metadata follow-up commit. Legacy repositories may still use a committed
+repo/.s11-capacity/repo-topic-map.json baseline/follow-up pair. External v2
+maps are atomically normalized to v3 before downstream validation; internal
+legacy maps require the explicit --upgrade-map flag.
 
 Additional task_plan[i].support_evidence is a list of >=2 objects:
   {module, role, artifact, behavior, path, start_line, end_line, excerpt}
@@ -57,6 +59,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import repo_rules as rules
+import topic_map_v3
 import tokenize
 from collections import Counter
 from typing import Any
@@ -345,7 +348,8 @@ def _json_process(command: list[str], repo: Path) -> dict:
 
 
 def check_capacity(repo: str | Path, map_path: str | Path | None = None,
-                   downstream_skill: str | Path | None = None, target: int = 36) -> dict:
+                   downstream_skill: str | Path | None = None, target: int = 36,
+                   upgrade_map: bool = False) -> dict:
     """Fresh read-only gate for verify/publish; never consumes a previous report.
 
     qualified_plan_count is all-or-nothing for integrity, downstream, mode and
@@ -354,7 +358,8 @@ def check_capacity(repo: str | Path, map_path: str | Path | None = None,
     errors are not converted into success. See module docstring for schemas.
     """
     repo = Path(repo).expanduser().resolve()
-    map_path = Path(map_path).expanduser().absolute() if map_path else repo / '.s11-capacity/repo-topic-map.json'
+    map_path = (Path(map_path).expanduser().absolute() if map_path
+                else rules.topic_map_path(repo))
     skill = Path(downstream_skill).expanduser().resolve() if downstream_skill else _default_downstream()
     scripts = skill / 'scripts'
     issues: list[str] = []
@@ -376,8 +381,37 @@ def check_capacity(repo: str | Path, map_path: str | Path | None = None,
             raise CapacityError('target 必须是正整数')
         if not repo.is_dir():
             raise CapacityError(f'仓库不存在: {repo}')
-        _, map_rel = _relative_file(repo, str(map_path.relative_to(repo)))
+        unresolved_map = map_path
+        if unresolved_map.is_symlink():
+            raise CapacityError(f'map 不允许符号链接: {unresolved_map}')
+        map_path = map_path.resolve()
+        external_map = not map_path.is_relative_to(repo)
+        map_rel = ""
+        if external_map:
+            external_dir = (repo.parent / rules.EXTERNAL_META_DIRNAME).resolve()
+            if map_path.parent != external_dir:
+                raise CapacityError(
+                    '仓外 map 必须精确位于生成容器的 .s11-meta 目录，不能引用任意路径')
+            if map_path.is_symlink() or not map_path.is_file():
+                raise CapacityError(f'仓外 map 必须是普通文件且不能是符号链接: {map_path}')
+        else:
+            _, map_rel = _relative_file(repo, str(map_path.relative_to(repo)))
+        map_schema_upgraded = False
+        if map_path.is_file():
+            normalized = json.loads(map_path.read_text(encoding='utf-8'))
+            if not isinstance(normalized, dict):
+                raise CapacityError('map 顶层必须是对象')
+            changed_schema = topic_map_v3.normalize_map(normalized)
+            if changed_schema:
+                if external_map or upgrade_map:
+                    topic_map_v3.write_normalized(map_path, normalized)
+                    map_schema_upgraded = True
+                else:
+                    raise CapacityError(
+                        '旧布局 map 仍是 v2 或缺少 v3 字段；提交前先显式运行 '
+                        '--upgrade-map，再提交升级后的容量材料')
         before = _snapshot(repo, map_path, scripts)
+        report['map_schema_upgraded'] = map_schema_upgraded
         report['source_head'] = before['head']
         if before['dirty_status']:
             issues.append('工作树/索引不干净（业务源码及 map 必须提交）: ' + before['dirty_status'])
@@ -385,15 +419,18 @@ def check_capacity(repo: str | Path, map_path: str | Path | None = None,
             issues.append('存在被忽略的未提交源码: ' + ', '.join(before['ignored_sources']))
         if before['hidden_index_flags']:
             issues.append('不允许 assume-unchanged/skip-worktree 隐藏源码变更: ' + ', '.join(before['hidden_index_flags']))
-        if map_rel not in before['tracked']:
-            issues.append('map 未提交：请放在 repo/.s11-capacity/repo-topic-map.json 并提交')
+        if not external_map and map_rel not in before['tracked']:
+            issues.append('旧布局 map 未提交：请在 repo/.s11-capacity/repo-topic-map.json 提交')
         # A staged-but-uncommitted map is rejected by dirty_status above.
         raw = json.loads(map_path.read_text(encoding='utf-8'))
         if not isinstance(raw, dict):
             raise CapacityError('map 顶层必须是对象')
         for key, value in (('version', 1), ('profile', 'gsb-semantic-v2'),
-                ('difficulty_contract_version', 2), ('type_policy', 'capacity-first')):
-            if raw.get(key) != value or (isinstance(value, int) and type(raw.get(key)) is not int):
+                ('difficulty_contract_version', 3), ('type_policy', 'capacity-first')):
+            if key == 'difficulty_contract_version':
+                if raw.get(key) != 3 or type(raw.get(key)) is not int:
+                    issues.append(f'map.{key} 必须是 3（不能用过期版本/基线）')
+            elif raw.get(key) != value or (isinstance(value, int) and type(raw.get(key)) is not int):
                 issues.append(f'map.{key} 必须是 {value!r}（不能用过期版本/基线）')
         base = raw.get('base_commit')
         if not isinstance(base, str) or len(base) not in {40, 64} or any(c not in '0123456789abcdef' for c in base):
@@ -401,33 +438,49 @@ def check_capacity(repo: str | Path, map_path: str | Path | None = None,
         resolved_base = _git(repo, 'rev-parse', '--verify', base + '^{commit}').decode().strip()
         if resolved_base != base:
             raise CapacityError('map.base_commit 不是精确的 commit SHA')
-        ancestry = _run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', base, before['head']], cwd=repo)
-        if ancestry.returncode != 0:
-            raise CapacityError('源码基线 S 必须是当前 HEAD H 的祖先')
-        changed = [os.fsdecode(p) for p in _git(repo, 'diff', '--no-ext-diff', '--no-renames',
-                    '--name-only', '-z', base, before['head'], '--').split(b'\0') if p]
-        forbidden = [p for p in changed if not p.startswith('.s11-capacity/') or not p.endswith('.json')]
-        if forbidden:
-            issues.append('S..H 只允许 .s11-capacity/ 下 JSON 元数据，存在源码/其他路径 diff: ' + ', '.join(forbidden))
-        for rel in changed:
-            if rel in forbidden:
-                continue
-            candidate = repo / rel
-            # Deletion of a JSON metadata file is permitted; all surviving files
-            # must really be JSON data, not executable or symlinked code.
-            if not candidate.exists() and not candidate.is_symlink():
-                continue
-            try:
-                candidate, _ = _relative_file(repo, rel)
-                if candidate.stat().st_mode & 0o111:
-                    raise CapacityError('JSON 元数据不能带可执行权限')
-                metadata = json.loads(candidate.read_text(encoding='utf-8'))
-                if not isinstance(metadata, (dict, list)):
-                    raise CapacityError('JSON 元数据顶层必须是对象或数组')
-            except (CapacityError, OSError, ValueError, UnicodeError) as exc:
-                issues.append(f'S..H 容量材料不是普通 JSON 元数据 {rel}: {exc}')
-        if not map_rel.startswith('.s11-capacity/'):
-            issues.append('map 必须位于仓库 .s11-capacity/ 下并在源码基线 S 之后单独提交')
+        changed: list[str] = []
+        if external_map:
+            if base != before['head']:
+                issues.append(
+                    '仓外 map.base_commit 必须等于当前最终源码 HEAD：'
+                    f'{base} != {before["head"]}')
+            report['metadata_location'] = 'external-container'
+        else:
+            ancestry = _run(
+                ['git', '-C', str(repo), 'merge-base', '--is-ancestor', base, before['head']],
+                cwd=repo,
+            )
+            if ancestry.returncode != 0:
+                raise CapacityError('旧布局源码基线 S 必须是当前 HEAD H 的祖先')
+            changed = [os.fsdecode(p) for p in _git(
+                repo, 'diff', '--no-ext-diff', '--no-renames', '--name-only', '-z',
+                base, before['head'], '--').split(b'\0') if p]
+            forbidden = [
+                p for p in changed
+                if not p.startswith('.s11-capacity/') or not p.endswith('.json')
+            ]
+            if forbidden:
+                issues.append(
+                    '旧布局 S..H 只允许 .s11-capacity/ 下 JSON 元数据，存在源码/其他路径 diff: '
+                    + ', '.join(forbidden))
+            for rel in changed:
+                if rel in forbidden:
+                    continue
+                candidate = repo / rel
+                if not candidate.exists() and not candidate.is_symlink():
+                    continue
+                try:
+                    candidate, _ = _relative_file(repo, rel)
+                    if candidate.stat().st_mode & 0o111:
+                        raise CapacityError('JSON 元数据不能带可执行权限')
+                    metadata = json.loads(candidate.read_text(encoding='utf-8'))
+                    if not isinstance(metadata, (dict, list)):
+                        raise CapacityError('JSON 元数据顶层必须是对象或数组')
+                except (CapacityError, OSError, ValueError, UnicodeError) as exc:
+                    issues.append(f'旧布局容量材料不是普通 JSON 元数据 {rel}: {exc}')
+            if not map_rel.startswith('.s11-capacity/'):
+                issues.append('旧布局 map 必须位于仓库 .s11-capacity/ 下并单独提交')
+            report['metadata_location'] = 'legacy-repo'
         report['source_base_commit'] = base
         report['baseline_to_head_paths'] = changed
         plans = raw.get('task_plan')
@@ -521,9 +574,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--map', dest='map_path')
     parser.add_argument('--downstream-skill', default=str(_default_downstream()))
     parser.add_argument('--target', type=int, default=36)
+    parser.add_argument('--upgrade-map', action='store_true',
+                        help='把旧布局 v2/missing-v3 topic map 原位升级为当前 v3；仓外 map 默认自动升级')
     parser.add_argument('--json-out', help='可选报告文件；必须在被检查仓库及下游 skill 之外')
     args = parser.parse_args(argv)
-    result = check_capacity(args.repo, args.map_path, args.downstream_skill, args.target)
+    result = check_capacity(
+        args.repo, args.map_path, args.downstream_skill, args.target,
+        upgrade_map=args.upgrade_map)
     if args.json_out:
         output = Path(args.json_out).expanduser().absolute()
         resolved = output.resolve()

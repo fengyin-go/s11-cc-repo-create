@@ -34,6 +34,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import github_settings
 import scaffold_repo
 import check_similarity
+import repo_rules
 
 SCAFFOLD = SCRIPT_DIR / "scaffold_repo.py"
 VERIFY = SCRIPT_DIR / "verify_repo.py"
@@ -175,6 +176,8 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
             if args.no_github_check:
                 cmd.append("--no-github-check")
             cmd.append("--git-init")
+            if getattr(args, "layout", None):
+                cmd.extend(["--layout", args.layout])
             with stage("生成", cmd, limits.scaffold) as scaffold:
                 repo_root = Path(scaffold["repo_root"])
                 record["repo_root"] = str(repo_root)
@@ -208,10 +211,12 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
 
         # 静态 CRUD 检查不代表足够支撑 36 道难题。prepared 验收及任何发布都强制过此门禁。
         if prepared or args.publish:
+            topic_map = repo_rules.topic_map_path(repo_root)
             capacity_cmd = [sys.executable, str(CAPACITY), "--repo", str(repo_root),
+                            "--map", str(topic_map),
                             "--json-out", str(Path(container) / "prompt-capacity-report.json")]
             with stage("出题容量验收", capacity_cmd, limits.probe,
-                       required_file=repo_root / ".s11-capacity" / "repo-topic-map.json") as capacity_report:
+                       required_file=topic_map) as capacity_report:
                 record["prompt_capacity"] = capacity_report
                 record["capacity_validated"] = True
                 log("出题容量验收", "通过（独立容量门禁，target 默认 36）")
@@ -224,6 +229,8 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
                 str(OPPORTUNITIES),
                 "--repo",
                 str(repo_root),
+                "--map",
+                str(topic_map),
                 "--briefs",
                 str(briefs_path),
                 "--out",
@@ -473,6 +480,8 @@ def main() -> int:
     parser.add_argument("--probe-jobs", type=_positive_int, default=2, help="重验收并发上限，默认 2")
     parser.add_argument("--publish-jobs", type=_positive_int, default=1, help="发布并发上限，默认 1")
     parser.add_argument("--prefix", help="项目编号前缀，默认 cc")
+    parser.add_argument("--layout", choices=["compact", "legacy"], default="compact",
+                        help="默认 compact 缩仓布局；legacy 仅用于旧模板回归")
     parser.add_argument("--frontend", choices=["vue", "react"])
     parser.add_argument("--backend", choices=["python", "java", "none"], help="none = 纯前端仓库")
     parser.add_argument("--owner", help="GitHub owner，默认读取本技能 GitHub 配置")

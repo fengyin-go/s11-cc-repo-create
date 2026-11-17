@@ -4,7 +4,7 @@
 
 1. **理论扫描容量**：`min(36, 主体×2, 12模式×3)` 只是文件/主体扫描下限，保留兼容静态检查，不证明H1/H2/H3。
 2. **原始候选池**：36 张正式机会卡 + 12 张同模式备用卡，共 48 个独特业务切入点；备用卡不发布为合格任务。
-3. **合格题位容量**：至少 36 条通过真实下游 semantic-v2、类型意图、领域 v2 和困难 v2 的计划，且 12 个可用模式每个正好 3 条。正式提示词还须在下游通过 G16/G19、模式/主题及历史/平台全局查重，不能预支平台通过结论。
+3. **合格题位容量**：至少 36 条通过真实下游 semantic-v2、类型意图、领域 v2 和困难 v3 的计划，且 12 个可用模式每个正好 3 条。正式提示词还须在下游通过 G16/G19、模式/主题及历史/平台全局查重，不能预支平台通过结论。
 
 若历史占用导致后续候选不足，回到业务补足/替换，而不是给相同题面换名。每次下游规则更新重新读当前实现及校准案例，不放宽模式上限、比例或困难契约。
 
@@ -31,16 +31,109 @@
 
 ## 文件契约
 
-`.s11-capacity/candidate-pool.json` 保存候选 ID、topic、类型、主要模块、数据产物、约束交互、设计轴、状态、淘汰/储备原因。可用业务语言，不写最终任务题面/验证命令。
+容量设计材料位于任务容器、源码仓库外：
 
-`.s11-capacity/repo-topic-map.json` 直接使用**当前下游格式**：
+```text
+<container>/.s11-meta/
+  candidate-pool.json
+  repo-topic-map.json
+  prompt-opportunity-briefs.json
+```
 
-- `profile: gsb-semantic-v2`、`version: 1`、`difficulty_contract_version: 2`、`type_policy: capacity-first`、真实domain/subdirection。
+`.s11-meta/candidate-pool.json` 保存候选 ID、topic、类型、主要模块、数据产物、约束交互、设计轴、状态、淘汰/储备原因。可用业务语言，不写最终任务题面/验证命令。新仓不得把这些材料提交进源码仓库。
+
+`.s11-meta/repo-topic-map.json` 直接使用**当前下游格式**：
+
+- `profile: gsb-semantic-v2`、`version: 1`、`difficulty_contract_version: 3`、`type_policy: capacity-first`、真实domain/subdirection。
 - topics写domain_objects/domain_results/evidence/seat_capacity；task_plan含sequence、slug/task_type、topic/family/angle、完整domain_fit/difficulty_design。H1两种约束有交互，H2不是观察面，H3允许两种真正可行裁决。
 - 每条task_plan再附本skill的 `support_evidence`（每项字段为 `module`、`role`、`artifact`、`behavior`、`path`、`start_line`、`end_line`、`excerpt`；主模块role用producer/writer/orchestrator，次模块名称/role/artifact与difficulty_design一致，excerpt为指定行区间完整连续原文）：两条以上指向真实不同业务模块的连续源码原文、行号与实际数据产物。测试、文档、注释/空壳不能替代业务源码。
 - 不要把support_evidence只放在README后宣称通过；源码锚点是机器可回查的必要证据，语义仍需逐题复核。
 
-**SHA无循环冻结：** 先提交业务源码得到S；map的base_commit=S；单独提交 `.s11-capacity/` 得到H。检查S是H祖先且两者间只有 `.s11-capacity/` 下普通非可执行JSON元数据变更。正式运行证据绑定H。业务源码再变时新建源码基线、刷新全部受影响锚点与审计。
+**最终HEAD绑定：** 先提交业务源码得到最终源码HEAD；仓外map的`base_commit`直接写该HEAD。检查器通过Git回查锚点并验证工作树干净，不需要再为map制造一个“只含元数据”的提交。业务源码再变时必须刷新map、锚点、机会地图和全部证据。旧仓库仓库内`.s11-capacity/`只保留兼容读取。
+
+## v3 difficulty_design 必填结构
+
+顶层`difficulty_contract_version`和每个`task_plan[].difficulty_design.version`都必须为3。
+
+每条约束必须使用稳定且不重复的`C1`、`C2`编号：
+
+```json
+{
+  "constraints": [
+    {
+      "id": "C1",
+      "kind": "transaction_consistency",
+      "statement": "主数据版本与下游消费记录必须同时可见",
+      "failure_if_omitted": "下游会读取到没有来源版本的半成品数据"
+    },
+    {
+      "id": "C2",
+      "kind": "failure_recovery",
+      "statement": "恢复任务只能补写缺失记录，不能覆盖上一份完整产物",
+      "failure_if_omitted": "重试会把已经可用的数据版本回退"
+    }
+  ]
+}
+```
+
+`design_tradeoff.decision_axis`只能取`source_of_truth`、`effective_time`、`completion_precedence`、`version_adoption`、`retention_vs_reclaim`、`recovery_vs_cleanup`、`old_vs_new_priority`、`authority_conflict`、`scope_boundary`、`partial_success_boundary`、`concurrency_conflict`、`migration_switch`、`other`。
+
+每个题位还必须有`workload_design`：
+
+```json
+{
+  "version": 1,
+  "expected_effective_tool_calls": 60,
+  "call_floor_rationale": "跨两个模块完成实现需要读取源码、设计接口、补齐失败恢复并验证两条独立数据链路，预计不少于60次有效工具调用。",
+  "work_slices": [
+    {
+      "module": "主业务模块",
+      "implementation": "实现主数据创建、校验、写入和状态流转",
+      "data_result": "主版本业务数据记录",
+      "verification": "验证主版本字段完整且状态可以追溯"
+    },
+    {
+      "module": "主业务模块",
+      "implementation": "补齐去重、失败恢复和版本冲突处理",
+      "data_result": "业务数据版本校验报告",
+      "verification": "验证重试不会覆盖上一份完整产物"
+    },
+    {
+      "module": "下游消费模块",
+      "implementation": "读取已确认产物并生成下游消费记录",
+      "data_result": "下游消费明细记录",
+      "verification": "验证消费模块只读取已确认版本"
+    },
+    {
+      "module": "下游消费模块",
+      "implementation": "落库异常审计、处理回执和追溯信息",
+      "data_result": "异常审计回执记录",
+      "verification": "验证回执与主版本数据可以逐条追溯"
+    }
+  ],
+  "verification_paths": [
+    "backend/tests/test_pipeline.py::test_cross_module_flow",
+    "backend/tests/test_pipeline.py::test_domain_snapshot_contract"
+  ]
+}
+```
+
+硬性下限：有效工具调用>=55、理由>=12字、至少4个切片、至少2个模块、每条切片有不同数据结果和独立验证、至少2条不同验证路径。`check_prompt_capacity.py`会对仓外旧map自动补齐结构字段；语义内容仍需独立review，不能把自动补齐当业务审核。
+
+### cc10014 操作词映射
+
+生成领域服务和`domain_fit.domain_chain.operation`只能使用下游批准词：采集、接入、抓取、爬取、导入、读取、解析、清洗、转换、标准化、关联、聚合、去重、校验、入湖、入库、落库、存储、写入、查询、计算、调度、回填、迁移、导出、切分、归并、合并、归档、水位。
+
+| 模块key | 原词 | 生成值 |
+|---|---|---|
+| `batch_registry` | 批次 | 校验 |
+| `error_handler` | 处理 | 校验 |
+| `data_retry` | 重采 | 采集 |
+| `collection_monitor` | 监控 | 查询 |
+| `incremental_tracker` | 水位 | 调度 |
+| `lineage_graph` | 血缘 | 关联 |
+| `template_mgr` | 模板 | 标准化 |
+| `archive_store` | 归档 | 归档 |
 
 ## 独立语义审核
 
@@ -58,4 +151,4 @@
 
 ## 交接到下游的最终SHA
 
-源仓内map的S只是避免自引用的源码基线。交接后在**批次目录**生成最终repo-topic-map，base_commit使用源仓最终已发布HEAD H，保留有效题位、刷新规则及历史去重并再跑下游完整硬闸。不要直接把base_commit=S的文件当作下游H基线的已通过证据，也不需要回写源仓制造新的SHA循环。
+交接时直接把仓外map复制到批次目录；`base_commit`已经是最终源仓HEAD。保留有效题位、刷新规则及历史去重并再跑下游完整硬闸，不回写源仓制造额外提交。
