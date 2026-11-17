@@ -135,16 +135,22 @@ def count_repository_files(repo: Path) -> int:
 
 def check_size_budget(repo: Path, code_size: dict[str, object], *, max_lines: int,
                       max_files: int) -> dict[str, object]:
-    problems: list[str] = []
+    warnings: list[str] = []
     code_lines = int(code_size["code_lines"])
     repo_files = count_repository_files(repo)
     if code_lines > max_lines:
-        problems.append(f"代码计行 {code_lines} > 紧凑上限 {max_lines}")
+        warnings.append(
+            f"代码计行 {code_lines} 超过紧凑目标 {max_lines}；生成后不再为凑阈值删除业务代码")
     if repo_files > max_files:
-        problems.append(f"仓库文件 {repo_files} > 紧凑上限 {max_files}")
+        warnings.append(
+            f"仓库文件 {repo_files} 超过紧凑目标 {max_files}；作为优化提示，不阻塞交付")
     return {
-        "ok": not problems,
-        "problems": problems,
+        # This is a generation-time target, not a post-generation deletion gate.
+        "ok": True,
+        "problems": [],
+        "warnings": warnings,
+        "exceeds_target": bool(warnings),
+        "advisory_only": True,
         "code_lines": code_lines,
         "repo_files": repo_files,
         "max_code_lines": max_lines,
@@ -968,7 +974,6 @@ def verify(repo: Path, *, min_lines: int, min_capacity: int, per_mode: int,
         "runnable_entries": "G1 启动入口",
         "auto_open": "G2 自动打开页面",
         "gitignore": "G3 .gitignore",
-        "size_budget": "G4 紧凑仓库体积",
         "capacity": "G5 出题容量",
         "compliance": "G6 内容合规",
         "env_preconditions": "G7 基础环境自洽",
@@ -983,6 +988,7 @@ def verify(repo: Path, *, min_lines: int, min_capacity: int, per_mode: int,
         "kind": resolved_kind,
         "gate_version": rules.GATE_VERSION,
         "failures": failures,
+        "warnings": list(checks["size_budget"].get("warnings") or []),
         "checks": checks,
     }
 

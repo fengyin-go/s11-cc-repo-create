@@ -15,7 +15,7 @@ description: 为 solo11 全自动生成可供 s11-gsb-prompt-create 出题的紧
 - 五类任务沿用下游准确名称和slug，`capacity-first`；30/30/30/5/5只是建议，不编造Bugfix或迁移目标，不人为埋bug凑数。
 - 完成指：真实业务实现 + >=36题位通过 + 提示词机会地图校验 + 查重 + 紧凑体积预算 + 一轮整体测试/至多一轮集中修复 + 干净克隆启动联通 + 清理 + 用户要求的发布/本地交付。某仓不足就补业务、换候选，不改闸、不以备注放行。
 - 默认使用compact布局：18个模块各自保留独立领域服务文件；前端只生成一个共享`WorkbenchView`，后端只生成一套通用资源路由。禁止重新复制18套完整页面、router或测试。
-- 默认代码计行<=6000、普通clone文件硬上限60（基线约55，给真实业务测试留少量余量），并校验18个领域主体仍可派生36容量。`legacy`布局只用于旧模板回归，不是新仓默认交付。
+- 生成时以代码约6000行、普通clone文件约60个为优化目标；生成完成后的超行/超文件只报告warning，不因超过一点再删业务代码或阻塞交付。正式硬性下限仍是2000行和18个领域主体的36容量。
 - 只生成底座、题位储备和提示词设计素材，不创建36个任务GitHub仓、不写最终tasks.xlsx、不跑模型、不提交平台。最终题面和历史查重仍归下游，不能承诺平台必过。
 - 生成提示词机会地图时必须写到生成仓库之外，默认 `<parent>/prompt-opportunities/<project_id>.json`；不得提交、推送或写入干净克隆。
 
@@ -113,6 +113,8 @@ python3 <skill>/scripts/probe_startup.py --repo <repo> --clean-clone \
 ```
 
 `--spec`仅生成草稿，不能用裸脚手架冒充高容量成品。`--prepared-repo`恢复原仓、不覆盖源码，但不重置测试/修复预算。`--skip-probe` / `--skip-install`只用于调试，不用于正式发布。发布器检查当前HEAD的**启动联通**与查重证据，重新核对静态/容量，但不补跑E2E或构建；`--skip-verify`不能绕过正式门禁。`--profile full`仅为显式首次整体测试保留，`--build`须与full一起用，绝不在最终流水线自动开启。
+
+流水线把静态、容量、机会地图、smoke、查重结果写入仓外`verification-bundle.json`，绑定HEAD、topic map和机会地图hash。publisher验证bundle后复用静态/容量结果，不再重复跑一遍；bundle缺失、HEAD/hash变化或直接调用publisher时仍完整重算。查重与登记也合并为一次`check_similarity.py --record`，禁止先查一遍再重算登记。
 
 只复用依赖下载缓存，不跨平台搬native node_modules/虚拟环境。最终probe报告标明 `verification_scope: startup-connectivity`，不缓存旧smoke成功结果、不声称浏览器全部业务正确。仅发布网络重试可复用同HEAD的现有报告，不重跑流水线。日志在仓外，临时克隆删净，只清本次PID/进程组。详见 [parallel-performance.md](references/parallel-performance.md)。
 

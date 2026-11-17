@@ -139,6 +139,18 @@ class QualityGatesTest(unittest.TestCase):
         self.assertGreaterEqual(len(operations), 18)
         self.assertTrue(set(operations) <= set(topic_map_v3.APPROVED_OPERATION_TERMS))
 
+    def test_size_above_generation_target_warns_but_does_not_block(self):
+        repo = self.root / "compact-size-warning"
+        scaffold_repo.scaffold(
+            scaffold_repo.normalize_spec(self.spec, "vue", "python"), repo)
+        result = verifier.verify(
+            repo, min_lines=2000, min_capacity=36, per_mode=3, per_subject=2,
+            max_lines=100, max_files=1)
+        self.assertTrue(result["ok"], result["failures"])
+        self.assertTrue(result["warnings"])
+        self.assertTrue(result["checks"]["size_budget"]["advisory_only"])
+        self.assertTrue(result["checks"]["size_budget"]["exceeds_target"])
+
     def test_compose_uses_service_name_for_proxy(self):
         repo = self.root / "compose"
         scaffold_repo.scaffold(self.spec, repo)

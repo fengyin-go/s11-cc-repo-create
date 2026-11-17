@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import io
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -129,3 +130,38 @@ class PublicationCapacityTests(unittest.TestCase):
             self.assertEqual(publisher.main(), 0)
         self.assertTrue(publish.call_args.args[0].execute)
         self.assertIsNone(publish.call_args.args[0].confirm)
+
+    def test_verification_bundle_reuses_current_head_gate_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            container = Path(tmp)
+            repo = container / "repo"
+            repo.mkdir()
+            (repo / ".s11-domain.json").write_text('{"domain":"数据工程"}')
+            meta = container / ".s11-meta"
+            meta.mkdir()
+            topic_map = meta / "repo-topic-map.json"
+            topic_map.write_text('{"difficulty_contract_version":3}')
+            opportunity = container / "opportunity.json"
+            opportunity.write_text('{"ok":true}')
+            head = "a" * 40
+            bundle = {
+                "schema_version": 1,
+                "ok": True,
+                "commit": head,
+                "static": {"ok": True},
+                "capacity": {"ok": True, "target": 36, "qualified_plan_count": 36},
+                "opportunity": {"ok": True},
+                "probe": {"ok": True},
+                "similarity": {"ok": True},
+                "topic_map_sha256": hashlib.sha256(topic_map.read_bytes()).hexdigest(),
+                "opportunity_path": str(opportunity),
+                "opportunity_sha256": hashlib.sha256(opportunity.read_bytes()).hexdigest(),
+            }
+            path = container / "verification-bundle.json"
+            path.write_text(json.dumps(bundle))
+            checked = publisher.check_verification_bundle(repo, head, path)
+            self.assertTrue(checked["ok"], checked["problems"])
+            topic_map.write_text('{"difficulty_contract_version":3,"changed":true}')
+            stale = publisher.check_verification_bundle(repo, head, path)
+            self.assertFalse(stale["ok"])
+            self.assertTrue(any("topic map" in item for item in stale["problems"]))

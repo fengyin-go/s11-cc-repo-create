@@ -27,6 +27,8 @@
 
 `run_pipeline.py` 只执行最终静态/容量/查重与 `probe_startup.py --clean-clone --profile startup`，不负责首次测试或自动修复。publisher不因没有build/E2E证据拒绝合格smoke，也不把smoke等同于全业务通过。`--profile full`是首次测试的显式工具，不能在最终阶段偷偷开启。
 
+查重与登记合并为一次`check_similarity.py --record`调用：先完成其他硬闸，再在同一文件锁内评估并原子登记，不再“查一遍、再重算一遍登记”。pipeline同时生成`verification-bundle.json`，绑定当前HEAD、topic map、机会地图和静态/容量/smoke结果；publisher验证hash后复用这些结果，不再重复跑静态验收和36题位容量。直接调用publisher且不提供验收包时仍会完整重算。
+
 ## 缓存与复用原则
 
 - npm采用lock约束的`npm ci`，复用下载缓存并优先离线命中；pip/Maven同样只复用各自下载/构件缓存。禁止复用脏工作树、把宿主node_modules搬进异架构容器、无锁改变依赖解析。

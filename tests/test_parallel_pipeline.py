@@ -324,6 +324,7 @@ class ParallelPipelineTests(unittest.TestCase):
         commands = [cmd for step, cmd in self.children.calls if step == "推送 GitHub"]
         self.assertEqual(len(commands), 2)
         self.assertTrue(all(cmd[cmd.index("--confirm") + 1] == "PUBLISH" for cmd in commands))
+        self.assertTrue(all("--verification-bundle" in cmd for cmd in commands))
 
     def test_publish_failure_only_offers_publish_retry_not_full_pipeline(self):
         self.children.responses["推送 GitHub"] = {"ok": False, "reason": "temporary publish outage"}

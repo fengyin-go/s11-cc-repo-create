@@ -123,6 +123,7 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
               "steps": {}, "step_seconds": {}, "wait_seconds": {}}
     active_step = "读取已准备仓库" if prepared else "生成"
     active_command: list[str] = []
+    verification_bundle_path: Path | None = None
 
     def log(step: str, detail: str) -> None:
         print(f"{tag} {step} ... {detail}", flush=True)
@@ -200,15 +201,6 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
             log("静态验收", f"通过（形态 {verify.get('kind')}，出题容量 {record['capacity']} 条 / "
                 f"主体 {record['subject_count']} 个 / {record['code_lines']} 行）")
 
-        with stage("跨仓库查重", [sys.executable, str(SIMILARITY), "--parent", str(args.parent),
-                                "--repo", str(repo_root)]) as similarity:
-            record["similarity"] = {"nearest": similarity.get("nearest"),
-                                    "history_count": similarity.get("history_count")}
-            if container:
-                Path(container, "similarity-report.json").write_text(
-                    json.dumps(similarity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            log("跨仓库查重", f"通过（历史 {similarity.get('history_count')} 个）")
-
         # 静态 CRUD 检查不代表足够支撑 36 道难题。prepared 验收及任何发布都强制过此门禁。
         if prepared or args.publish:
             topic_map = repo_rules.topic_map_path(repo_root)
@@ -267,18 +259,65 @@ def run_one(spec_path: Path, args: argparse.Namespace, index: int, total: int,
                     raise StepFailed("真启动验收", "探针未确认进程清理成功，禁止登记与发布")
                 log("真启动验收", "通过（进程清理 True）")
 
-        # registry 自身已有文件锁和原子写，不再把全部仓库的验收串行化。
-        with stage("登记业务指纹", [sys.executable, str(SIMILARITY), "--parent", str(args.parent),
-                                 "--repo", str(repo_root), "--record", "--project-id",
-                                 str(record["project_id"])]) as registered:
-            record["registry"] = registered.get("recorded", {}).get("registry")
+        # 查重成功后才登记；--record 在内部只评估一次并原子写入，避免三遍源码扫描。
+        similarity_cmd = [
+            sys.executable, str(SIMILARITY), "--parent", str(args.parent),
+            "--repo", str(repo_root), "--record", "--project-id",
+            str(record["project_id"]),
+        ]
+        with stage("跨仓库查重", similarity_cmd) as similarity:
+            record["similarity"] = {"nearest": similarity.get("nearest"),
+                                    "history_count": similarity.get("history_count")}
+            record["registry"] = (similarity.get("recorded") or {}).get("registry")
+            record["steps"]["登记业务指纹"] = True
+            record["step_seconds"]["登记业务指纹"] = record["step_seconds"].get("跨仓库查重", 0.0)
+            record["wait_seconds"]["登记业务指纹"] = 0.0
+            if container:
+                Path(container, "similarity-report.json").write_text(
+                    json.dumps(similarity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            log("跨仓库查重", f"通过并登记（历史 {similarity.get('history_count')} 个）")
 
         if not args.publish:
             skipped("推送 GitHub", "未加 --publish，只做本地预演")
         else:
+            import hashlib
+            head = str(probe.get("source_head") or "")
+            topic_map = repo_rules.topic_map_path(repo_root)
+            topic_map_sha = (
+                hashlib.sha256(topic_map.read_bytes()).hexdigest()
+                if topic_map.is_file() and not topic_map.is_symlink() else ""
+            )
+            bundle = {
+                "schema_version": 1,
+                "commit": head,
+                "ok": all(
+                    isinstance(item, dict) and item.get("ok") is True
+                    for item in (verify, similarity, capacity_report,
+                                 opportunity_report, probe)
+                ),
+                "static": verify,
+                "similarity": similarity,
+                "capacity": capacity_report,
+                "opportunity": opportunity_report,
+                "probe": probe,
+                "topic_map": str(topic_map),
+                "topic_map_sha256": topic_map_sha,
+                "opportunity_path": str(opportunities_path),
+                "opportunity_sha256": (
+                    hashlib.sha256(opportunities_path.read_bytes()).hexdigest()
+                    if opportunities_path.is_file() and not opportunities_path.is_symlink() else ""
+                ),
+            }
+            verification_bundle_path = Path(container) / "verification-bundle.json"
+            verification_bundle_path.write_text(
+                json.dumps(bundle, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            record["verification_bundle"] = str(verification_bundle_path)
             publish_cmd = [sys.executable, str(PUBLISH), "--repo", str(repo_root),
                            "--visibility", args.visibility, "--json", "--execute", "--confirm", "PUBLISH",
-                           "--opportunity-map", str(opportunities_path)]
+                           "--opportunity-map", str(opportunities_path),
+                           "--verification-bundle", str(verification_bundle_path)]
             # 保留发布子脚本现有协议；授权已由顶层 --publish 明确给出。
             if args.owner:
                 publish_cmd += ["--owner", args.owner]

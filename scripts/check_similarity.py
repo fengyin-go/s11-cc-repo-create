@@ -268,8 +268,9 @@ def evaluate(
     }
 
 
-def record(parent: Path, repo: Path, project_id: str) -> dict:
-    spec = scaffold_repo.normalize_spec(json.loads((repo / SPEC_FILE).read_text(encoding="utf-8")))
+def record(parent: Path, repo: Path, project_id: str, *, spec: dict | None = None) -> dict:
+    spec = spec or scaffold_repo.normalize_spec(
+        json.loads((repo / SPEC_FILE).read_text(encoding="utf-8")))
     relative = str(repo.resolve().relative_to(parent.resolve()))
     entry = {
         "project_id": project_id,
@@ -305,7 +306,7 @@ def record(parent: Path, repo: Path, project_id: str) -> dict:
             if temporary_name and Path(temporary_name).exists():
                 Path(temporary_name).unlink()
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    return {"ok": True, "registry": str(path), "entry": entry}
+    return {"ok": True, "registry": str(path), "entry": entry, "check": checked}
 
 
 def main() -> int:
@@ -331,19 +332,22 @@ def main() -> int:
         except SystemExit as exc:
             print(json.dumps({"ok": False, "reason": str(exc)}, ensure_ascii=False, indent=2))
             return 1
-    history = [entry for entry in discover_history(parent)
-               if repo is None or not entry.get("repo") or (parent / str(entry["repo"])).resolve() != repo.resolve()]
-    report = evaluate(spec, history, repo=repo, parent=parent)
+    if args.record:
+        if repo is None:
+            parser.error("--record 需配合 --repo")
+        recorded = record(parent, repo, args.project_id or repo.name, spec=spec)
+        report = recorded.pop("check")
+        report["recorded"] = recorded
+    else:
+        history = [entry for entry in discover_history(parent)
+                   if repo is None or not entry.get("repo")
+                   or (parent / str(entry["repo"])).resolve() != repo.resolve()]
+        report = evaluate(spec, history, repo=repo, parent=parent)
     report["spec"] = str(args.spec) if args.spec else str(repo / SPEC_FILE)
     report["parent"] = str(parent)
     if repo is not None:
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
         report["source_head"] = head.stdout.strip() if head.returncode == 0 else ""
-    if args.record:
-        if repo is None:
-            parser.error("--record 需配合 --repo")
-        if report["ok"]:
-            report["recorded"] = record(parent, repo, args.project_id or repo.name)
     text = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
     if args.json_out:
         Path(args.json_out).expanduser().write_text(text, encoding="utf-8")

@@ -11,7 +11,7 @@
 | G1 结构 | 前端 Vue 或 React、后端 Java 或 Python，双端各有依赖清单与启动入口；默认共享`WorkbenchView`和一套资源路由。纯前端不要求后端，但必须有`local-service.ts`、`frontend/src/domain/*.ts`和本地持久化 | `verify_repo.py` |
 | G2 启动 | 前端 dev server 关掉「自动打开页面」 | `verify_repo.py` |
 | G3 忽略 | 根目录 `.gitignore` 覆盖依赖 / 缓存 / 构建产物 / 日志 / 环境文件 | `verify_repo.py` |
-| G4 体量 | 源码计行 2000～6000；普通clone文件基线约55、硬上限60；不含依赖、构建物、锁文件和仓外容量材料 | `verify_repo.py` |
+| G4 体量 | 源码计行硬下限2000；约6000行/60文件是生成目标，超出只告警，不阻塞交付、不触发事后删代码 | `verify_repo.py` |
 | G5 草稿容量 | 静态公式 >=36，不证明困难题有效容量 | `verify_repo.py` |
 | G6 合规 | 不是禁用题型仓库，无密钥、无超大文件、无违规业务域，且题域不命中 0731 严禁出题清单 | `verify_repo.py` |
 | G7 环境 | 基础环境自洽：Python 全量可编译、后端入口能 import、依赖都声明、没有写死本机路径 | `verify_repo.py` |

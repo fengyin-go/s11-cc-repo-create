@@ -401,6 +401,65 @@ def check_delivery_evidence(repo: Path, head: str) -> dict[str, object]:
     return {"ok": not problems, "problems": problems, "reports": sorted(reports)}
 
 
+def check_verification_bundle(repo: Path, head: str, bundle_path: Path | None) -> dict:
+    """Validate pipeline-produced read-only evidence before skipping duplicate gates."""
+    if bundle_path is None:
+        return {"ok": False, "problems": ["未提供 pipeline 验收包"], "used": False}
+    path = Path(bundle_path).expanduser().resolve()
+    problems: list[str] = []
+    if path.is_relative_to(repo):
+        problems.append("verification bundle 必须位于源码仓库外")
+    if path.is_symlink() or not path.is_file():
+        problems.append(f"verification bundle 不是普通文件：{path}")
+    if problems:
+        return {"ok": False, "problems": problems, "used": False, "path": str(path)}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "problems": [f"无法读取 verification bundle：{exc}"],
+                "used": False, "path": str(path)}
+    if not isinstance(payload, dict):
+        return {"ok": False, "problems": ["verification bundle 顶层必须是对象"],
+                "used": False, "path": str(path)}
+    if payload.get("schema_version") != 1 or payload.get("ok") is not True:
+        problems.append("verification bundle schema_version/ok 无效")
+    if payload.get("commit") != head:
+        problems.append("verification bundle 未绑定当前 HEAD")
+    for key in ("static", "capacity", "opportunity", "probe", "similarity"):
+        item = payload.get(key)
+        if not isinstance(item, dict) or item.get("ok") is not True:
+            problems.append(f"verification bundle 的 {key} 不是成功对象")
+    capacity = payload.get("capacity") if isinstance(payload.get("capacity"), dict) else {}
+    if capacity.get("target") != 36 or capacity.get("qualified_plan_count") != 36:
+        problems.append("verification bundle 容量结果不是正式36题位")
+    topic_map = rules.topic_map_path(repo)
+    expected_map_sha = (
+        hashlib.sha256(topic_map.read_bytes()).hexdigest()
+        if topic_map.is_file() and not topic_map.is_symlink() else ""
+    )
+    if not expected_map_sha or payload.get("topic_map_sha256") != expected_map_sha:
+        problems.append("verification bundle 的 topic map hash 与当前仓外map不一致")
+    opportunity_path = Path(str(payload.get("opportunity_path") or "")).expanduser()
+    if (
+        not str(opportunity_path)
+        or opportunity_path.is_relative_to(repo)
+        or not opportunity_path.is_relative_to(repo.parent)
+        or opportunity_path.is_symlink()
+        or not opportunity_path.is_file()
+        or hashlib.sha256(opportunity_path.read_bytes()).hexdigest()
+        != payload.get("opportunity_sha256")
+    ):
+        problems.append("verification bundle 的机会地图路径/hash 与当前文件不一致")
+    return {
+        "ok": not problems,
+        "problems": problems,
+        "used": not problems,
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "payload": payload,
+    }
+
+
 def publish(args) -> dict[str, object]:
     repo = Path(args.repo).expanduser().resolve()
     branch = args.branch
@@ -431,9 +490,32 @@ def publish(args) -> dict[str, object]:
     report["steps"].append({"step": "工作区干净", "ok": not dirty_blocked,
                             "detail": status[:200] or "clean"})
 
+    requested_bundle = getattr(args, "verification_bundle", None)
+    bundle_check = check_verification_bundle(
+        repo, head, Path(requested_bundle).expanduser() if requested_bundle else None)
+    report["verification_bundle"] = {
+        key: value for key, value in bundle_check.items() if key != "payload"
+    }
+    if requested_bundle:
+        report["steps"].append({
+            "step": "流水线验收包",
+            "ok": True,
+            "detail": (
+                f"复用当前HEAD静态/容量结果 {bundle_check.get('sha256', '')[:12]}"
+                if bundle_check["ok"]
+                else "验收包无效，已回退完整重算：" + "；".join(bundle_check["problems"])[:350]
+            ),
+        })
+
     if not args.skip_verify:
-        result = verifier.verify(repo, min_lines=2000, min_capacity=rules.MIN_CAPACITY,
-                                 per_mode=rules.MAX_PER_MODE, per_subject=rules.MAX_PER_SUBJECT)
+        result = (
+            bundle_check["payload"]["static"]
+            if bundle_check["ok"] else
+            verifier.verify(repo, min_lines=2000, min_capacity=rules.MIN_CAPACITY,
+                            per_mode=rules.MAX_PER_MODE, per_subject=rules.MAX_PER_SUBJECT)
+        )
+        report["verification_source"] = (
+            "pipeline-bundle" if bundle_check["ok"] else "recomputed")
         report["steps"].append({"step": "静态验收通过", "ok": bool(result["ok"]),
                                 "detail": "全部硬性要求通过" if result["ok"]
                                 else "；".join(result["failures"])[:400]})
@@ -443,7 +525,10 @@ def publish(args) -> dict[str, object]:
     if args.execute and is_s11:
         # Re-evaluate the inexpensive capacity gate, never trust a hand-edited pass JSON.
         # This runs before authentication or any remote write, including --remote-url.
-        capacity = check_prompt_capacity.check_capacity(repo)
+        capacity = (
+            bundle_check["payload"]["capacity"]
+            if bundle_check["ok"] else check_prompt_capacity.check_capacity(repo)
+        )
         report["prompt_capacity"] = capacity
         capacity_ok = capacity.get("ok") is True
         report["steps"].append({
@@ -456,11 +541,14 @@ def publish(args) -> dict[str, object]:
             getattr(args, "opportunity_map", None)
             or repo.parent / "prompt-opportunities" / f"{repo.name}.json"
         ).expanduser().resolve()
-        opportunity = build_prompt_opportunities.validate_existing(
-            repo,
-            opportunity_path,
-            capacity=capacity,
-            expected_head=head,
+        opportunity = (
+            bundle_check["payload"]["opportunity"]
+            if bundle_check["ok"] else build_prompt_opportunities.validate_existing(
+                repo,
+                opportunity_path,
+                capacity=capacity,
+                expected_head=head,
+            )
         )
         report["prompt_opportunities"] = opportunity
         report["steps"].append({
@@ -664,6 +752,10 @@ def main() -> int:
     parser.add_argument(
         "--opportunity-map",
         help="仓库外提示词机会地图；默认 <repo父目录>/prompt-opportunities/<repo名>.json",
+    )
+    parser.add_argument(
+        "--verification-bundle",
+        help="pipeline 生成的当前HEAD仓外验收包；有效时复用静态/容量结果，避免发布前重复跑",
     )
     parser.add_argument("--skip-verify", action="store_true",
                         help="跳过静态验收。只有推「不是本 skill 生成的项目」的仓库时才用"
